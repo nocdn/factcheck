@@ -166,7 +166,7 @@ The implementation enables:
 - `thinkingConfig.includeThoughts = true`
 - `responseMimeType = "text/plain"`
 
-The server also emits verbose logs for each request, including request settings, downloader activity, generated Exa queries, Exa sources, Gemini request settings, token usage, returned analysis, and any thought text returned by the SDK.
+The server also emits verbose logs for each request, including request settings, downloader activity, generated Exa queries, Exa sources, Gemini request settings, finish reasons, token usage, returned analysis, and any thought text returned by the SDK.
 
 ## Environment variables
 
@@ -182,7 +182,7 @@ All variables are optional unless marked required.
 | `GEMINI_API_KEY` | Gemini Developer API key | required for `/api/check` |
 | `GEMINI_MODEL` | Gemini model used for fact-checking | `gemini-3-flash-preview` |
 | `GEMINI_TIMEOUT_MS` | Gemini request timeout in ms | `300000` |
-| `FACT_CHECK_MAX_OUTPUT_TOKENS` | Max output tokens requested from Gemini | `8192` |
+| `FACT_CHECK_MAX_OUTPUT_TOKENS` | Max output tokens requested from Gemini, including thinking tokens | `32768` |
 | `FACT_CHECK_SEARCH_PLAN_MAX_OUTPUT_TOKENS` | Max output tokens requested when Gemini plans Exa searches | `2048` |
 | `EXA_API_KEY` | Exa API key used for web evidence searches | required for `/api/check` |
 | `EXA_SEARCH_TYPE` | Exa search type used for generated queries | `auto` |

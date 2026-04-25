@@ -24,7 +24,7 @@ const factCheckDownloadQuality = process.env.FACT_CHECK_DEFAULT_QUALITY?.trim() 
 const inlineVideoMaxBytes = parseIntegerEnv("INLINE_VIDEO_MAX_BYTES", 18 * 1024 * 1024);
 const downloadTimeoutMs = parseIntegerEnv("VIDEO_DOWNLOAD_TIMEOUT_MS", 120_000);
 const geminiTimeoutMs = parseIntegerEnv("GEMINI_TIMEOUT_MS", 300_000);
-const factCheckMaxOutputTokens = parseIntegerEnv("FACT_CHECK_MAX_OUTPUT_TOKENS", 8_192);
+const factCheckMaxOutputTokens = parseIntegerEnv("FACT_CHECK_MAX_OUTPUT_TOKENS", 32_768);
 const searchPlanMaxOutputTokens = parseIntegerEnv("FACT_CHECK_SEARCH_PLAN_MAX_OUTPUT_TOKENS", 2_048);
 
 const supportedQualities = new Set([
@@ -261,6 +261,8 @@ app.post("/api/check", async (c) => {
     logEvent(requestId, "gemini_response_received", {
       responseId: response.responseId ?? null,
       modelVersion: response.modelVersion ?? null,
+      finishReason: candidate?.finishReason ?? null,
+      finishMessage: candidate?.finishMessage ?? null,
       promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
       candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
       thoughtsTokenCount: response.usageMetadata?.thoughtsTokenCount ?? null,
@@ -676,6 +678,7 @@ async function createSearchPlan(
     queryCount: exaSearchQueryCount,
     mimeType: videoInput.mimeType,
     sizeBytes: videoInput.sizeBytes,
+    thinkingLevel: ThinkingLevel.HIGH,
   });
 
   const response = await ai!.models.generateContent({
@@ -703,7 +706,7 @@ async function createSearchPlan(
       temperature: 0.2,
       thinkingConfig: {
         includeThoughts: false,
-        thinkingLevel: ThinkingLevel.LOW,
+        thinkingLevel: ThinkingLevel.HIGH,
       },
     },
   });
@@ -717,6 +720,8 @@ async function createSearchPlan(
   logEvent(requestId, "search_plan_completed", {
     responseId: response.responseId ?? null,
     modelVersion: response.modelVersion ?? null,
+    finishReason: response.candidates?.[0]?.finishReason ?? null,
+    finishMessage: response.candidates?.[0]?.finishMessage ?? null,
     promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
     candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
     thoughtsTokenCount: response.usageMetadata?.thoughtsTokenCount ?? null,
