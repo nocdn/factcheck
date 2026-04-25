@@ -158,7 +158,7 @@ The prompt instructs Gemini to:
 - avoid near-duplicate searches when possible while allowing overlap for very specific topics
 - distinguish historically supported origin claims from widely repeated but uncertain origin stories
 - call out false, misleading, missing-context, or unverifiable claims
-- return plain text only with no markdown, use inline [1] style references in the analysis, and end with a `Sources` block (`[1] - https://...` one URL per line)
+- return plain text only with no markdown, use inline references in the analysis (`[1]` for one source, `[1][2][3]` for several—adjacent brackets, not `[1, 2, 3]`), then end with `Sources:` (`[1] - https://...` one URL per line) followed by `Searches:` (one raw query per line)
 
 The implementation enables:
 

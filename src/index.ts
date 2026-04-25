@@ -92,8 +92,9 @@ const factCheckSystemInstruction = [
   "Do not invent facts, sources, certainty, or quotes.",
   "If evidence is mixed, outdated, or incomplete, say so plainly.",
   "The final fact-check must be plain text only with zero markdown of any kind; that is very important. No headers, no bold, no italics, no links in markdown, no backticks, no list markers except the citation format below.",
-  "In the main analysis, cite sources using inline bracket numbers only, like [1] or [2], matching the Sources list at the end. Use only the numbers 1, 2, and so on that you assign in the final Sources list.",
-  "End the response with a final Sources section: one line per source, in order, exactly like this: [1] - https://example.com/path (then [2] - https://... on the next line, and so on). No other format for that list.",
+  "In the main analysis, cite sources using inline bracket numbers only, matching the Sources list at the end. For a single source use [1]. For multiple sources, repeat brackets with no commas or spaces between them, like [1][2][4][9]. Do not use one bracket with commas inside, such as [1, 2, 4, 9]. Use only the numbers 1, 2, and so on that you assign in the final Sources list.",
+  "End the response with a final Sources: section: one line per source, in order, exactly like this: [1] - https://example.com/path (then [2] - https://... on the next line, and so on). No other format for that list.",
+  "After Sources:, add a final Searches: section listing every Exa search query that was performed, one raw query per line with no numbering or prefixes.",
   "If you cite a source in the text, it must appear in Sources with the same number and URL. Only include URLs you actually use from the Exa search context.",
 ].join(" ");
 
@@ -202,7 +203,7 @@ app.post("/api/check", async (c) => {
     const prompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext);
     const searchPlan = await createSearchPlan(requestId, videoInput, prompt);
     const searchResults = await runExaSearches(requestId, searchPlan.searches);
-    const searchContext = buildSearchContext(searchResults);
+    const searchContext = buildSearchContext(searchResults, searchPlan.searches);
     const finalPrompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext, searchContext);
 
     logEvent(requestId, "gemini_request_prepared", {
@@ -878,12 +879,20 @@ async function runExaSearch(query: string): Promise<ExaSearchResponse> {
   return isRecord(body) ? body as ExaSearchResponse : {};
 }
 
-function buildSearchContext(results: SearchResultContext[]): string {
+function buildSearchContext(results: SearchResultContext[], searches: SearchQuery[]): string {
   if (!results.length) {
-    return "No Exa search results were returned. Say that outside evidence was unavailable instead of guessing.";
+    return [
+      "No Exa search results were returned. Say that outside evidence was unavailable instead of guessing.",
+      "",
+      "Exa searches performed:",
+      ...searches.map((search) => search.query),
+    ].join("\n");
   }
 
   return [
+    "Exa searches performed:",
+    ...searches.map((search) => search.query),
+    "",
     "Exa search results with full page text:",
     ...results.map((result, index) => [
       "",
@@ -905,18 +914,20 @@ function buildFactCheckPrompt(url: string | null, additionalContext: string | nu
     "Identify the material factual claims made in speech, captions, on-screen text, and visuals.",
     "Fact-check those claims against the Exa search evidence provided below.",
     "Use the search evidence to verify dates, places, names, health claims, politics, science, history, crime, war, statistics, alleged quotes, and other factual details.",
-    "When a conclusion is supported by a specific Exa result, mark it in the main text with a bracket number only, e.g. [1], that refers to the numbered line in the Sources list at the end. Do not paste long URLs in the main paragraphs.",
+    "When a conclusion is supported by Exa results, cite in the main text with bracket numbers only: one source is [1]; several sources are written as adjacent brackets, e.g. [1][2][4][9], never [1, 2, 4, 9]. Each number refers to the same-numbered line in the Sources list at the end. Do not paste long URLs in the main paragraphs.",
     "If the search evidence does not cover a claim, say it is unverifiable from the available evidence.",
     "For origin stories, distinguish claims that are historically supported from claims that are merely widely repeated but uncertain.",
     "",
     "Output format requirements (very important): the entire response must be plain text with no markdown. No # headings, no asterisks for bold or italics, no backticks, no link syntax like square brackets for URLs, no blockquotes, no code fences, no tables.",
     "Write one short overall verdict sentence first.",
     "Then write one short summary paragraph.",
-    "Then cover each significant claim in plain text as continuous paragraphs, one after another, using [1] style references where evidence applies.",
+    "Then cover each significant claim in plain text as continuous paragraphs, one after another, using [1] or [1][2] style references (adjacent brackets only) where evidence applies.",
     "For each claim, say whether it is true, false, misleading, missing context, or unverifiable, and explain why.",
     "Call out omitted context, outdated footage, manipulated framing, and mismatches between the visuals and the narration when present.",
-    "After the analysis, on its own, add a blank line, then a line with exactly: Sources",
+    "After the analysis, on its own, add a blank line, then a line with exactly: Sources:",
     "Then one line per cited source in order, each line exactly: [n] - https://full.url/path (for example: [1] - https://example.com/page )",
+    "After the source lines, add a blank line, then a line with exactly: Searches:",
+    "Then list every Exa search query from the Exa searches performed section, one raw query per line, with no numbers, bullets, prefixes, or extra text.",
   ];
 
   if (url) {
