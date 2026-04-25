@@ -13,7 +13,6 @@ const healthLimit = parseIntegerEnv("HEALTH_RATE_LIMIT_MAX", 1);
 
 const videoDownloadApiUrl = process.env.VIDEO_DOWNLOAD_API_URL?.trim() || "https://videos.bartoszbak.org/api/download";
 const geminiApiKey = process.env.GEMINI_API_KEY?.trim() || process.env.GOOGLE_API_KEY?.trim() || "";
-const geminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-3-flash-preview";
 const exaApiKey = process.env.EXA_API_KEY?.trim() || "";
 const exaSearchType = process.env.EXA_SEARCH_TYPE?.trim() || "auto";
 const exaSearchQueryCount = parseBoundedIntegerEnv("EXA_SEARCH_QUERY_COUNT", 3, 1, 10);
@@ -26,6 +25,8 @@ const downloadTimeoutMs = parseIntegerEnv("VIDEO_DOWNLOAD_TIMEOUT_MS", 120_000);
 const geminiTimeoutMs = parseIntegerEnv("GEMINI_TIMEOUT_MS", 300_000);
 const factCheckMaxOutputTokens = parseIntegerEnv("FACT_CHECK_MAX_OUTPUT_TOKENS", 32_768);
 const searchPlanMaxOutputTokens = parseIntegerEnv("FACT_CHECK_SEARCH_PLAN_MAX_OUTPUT_TOKENS", 2_048);
+const defaultGeminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-3-flash-preview";
+const defaultReasoningEffort = process.env.REASONING_EFFORT?.trim().toLowerCase() || "high";
 
 const supportedQualities = new Set([
   "best",
@@ -36,6 +37,41 @@ const supportedQualities = new Set([
   "480p",
   "360p",
 ]);
+
+const supportedGeminiModels = [
+  "gemini-3-flash-preview",
+  "gemini-3.1-flash-lite-preview",
+] as const;
+
+const supportedReasoningEfforts = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+] as const;
+
+type SupportedGeminiModel = typeof supportedGeminiModels[number];
+type ReasoningEffort = typeof supportedReasoningEfforts[number];
+
+const supportedReasoningEffortsByModel: Record<SupportedGeminiModel, readonly ReasoningEffort[]> = {
+  "gemini-3-flash-preview": supportedReasoningEfforts,
+  "gemini-3.1-flash-lite-preview": supportedReasoningEfforts,
+};
+
+const thinkingLevelByReasoningEffort: Record<ReasoningEffort, ThinkingLevel> = {
+  minimal: ThinkingLevel.MINIMAL,
+  low: ThinkingLevel.LOW,
+  medium: ThinkingLevel.MEDIUM,
+  high: ThinkingLevel.HIGH,
+};
+
+type GeminiRequestSettings = {
+  model: SupportedGeminiModel;
+  reasoningEffort: ReasoningEffort;
+  thinkingLevel: ThinkingLevel;
+};
+
+const defaultGeminiSettings = resolveGeminiSettings(defaultGeminiModel, defaultReasoningEffort);
 
 type UrlFactCheckInput = {
   iosCompatible: boolean;
@@ -131,7 +167,8 @@ app.get("/api/health", healthLimiter, (c) => {
     status: "ok",
     geminiConfigured: Boolean(geminiApiKey),
     exaConfigured: Boolean(exaApiKey),
-    model: geminiModel,
+    model: defaultGeminiSettings.model,
+    reasoningEffort: defaultGeminiSettings.reasoningEffort,
   });
 });
 
@@ -141,7 +178,8 @@ app.get("/api", (c) => {
     status: "ok",
     port,
     routes: ["/api/health", "/api/check"],
-    model: geminiModel,
+    model: defaultGeminiSettings.model,
+    reasoningEffort: defaultGeminiSettings.reasoningEffort,
   });
 });
 
@@ -182,7 +220,8 @@ app.post("/api/check", async (c) => {
     proxy: parsedBody.inputMode === "url" ? parsedBody.proxy : null,
     additionalContextLength: parsedBody.additionalContext?.length ?? 0,
     inlineVideoMaxBytes,
-    geminiModel,
+    geminiModel: parsedBody.model,
+    reasoningEffort: parsedBody.reasoningEffort,
   });
 
   try {
@@ -205,7 +244,7 @@ app.post("/api/check", async (c) => {
     }
 
     const prompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext);
-    const searchPlan = await createSearchPlan(requestId, videoInput, prompt);
+    const searchPlan = await createSearchPlan(requestId, videoInput, prompt, parsedBody);
     const searchResults = await runExaSearches(requestId, searchPlan.searches);
     const searchContext = buildSearchContext(searchResults, searchPlan.searches);
     const finalPrompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext, searchContext);
@@ -219,7 +258,7 @@ app.post("/api/check", async (c) => {
       systemInstructionPreview: truncate(factCheckSystemInstruction, 300),
       promptPreview: truncate(finalPrompt, 500),
       responseMimeType: "text/plain",
-      thinkingLevel: ThinkingLevel.HIGH,
+      thinkingLevel: parsedBody.thinkingLevel,
       exaSearchEnabled: true,
       exaSearchQueryCount: searchPlan.searches.length,
       exaSearchResultCount: searchResults.length,
@@ -227,7 +266,7 @@ app.post("/api/check", async (c) => {
     });
 
     const response = await ai.models.generateContent({
-      model: geminiModel,
+      model: parsedBody.model,
       contents: [
         {
           inlineData: {
@@ -247,7 +286,7 @@ app.post("/api/check", async (c) => {
         temperature: 0.2,
         thinkingConfig: {
           includeThoughts: true,
-          thinkingLevel: ThinkingLevel.HIGH,
+          thinkingLevel: parsedBody.thinkingLevel,
         },
       },
     });
@@ -288,7 +327,8 @@ app.post("/api/check", async (c) => {
       id: requestId,
       inputMode: parsedBody.inputMode,
       url: parsedBody.url,
-      model: geminiModel,
+      model: parsedBody.model,
+      reasoningEffort: parsedBody.reasoningEffort,
       analysis,
       reasoning,
       download: parsedBody.inputMode === "url"
@@ -377,8 +417,11 @@ async function parseFactCheckRequest(
       additionalContext: string | null;
       inputMode: "url";
       iosCompatible: boolean;
+      model: SupportedGeminiModel;
       proxy: boolean;
       quality: string;
+      reasoningEffort: ReasoningEffort;
+      thinkingLevel: ThinkingLevel;
       url: string;
     }
   | {
@@ -387,7 +430,10 @@ async function parseFactCheckRequest(
       filename: string;
       inputMode: "file";
       mimeType: string;
+      model: SupportedGeminiModel;
+      reasoningEffort: ReasoningEffort;
       sizeBytes: number;
+      thinkingLevel: ThinkingLevel;
       url: string | null;
     }
   | { error: string; status: 400 | 413 }
@@ -449,14 +495,52 @@ async function parseFactCheckRequest(
     return { error: "The additionalContext field must be a string when provided.", status: 400 };
   }
 
+  if (typeof body.model !== "undefined" && typeof body.model !== "string") {
+    return { error: "The model field must be a string when provided.", status: 400 };
+  }
+
+  if (typeof body.reasoningEffort !== "undefined" && typeof body.reasoningEffort !== "string") {
+    return { error: "The reasoningEffort field must be a string when provided.", status: 400 };
+  }
+
+  if (typeof body.effort !== "undefined" && typeof body.effort !== "string") {
+    return { error: "The effort field must be a string when provided.", status: 400 };
+  }
+
+  const rawReasoningEffort = typeof body.reasoningEffort === "string" ? body.reasoningEffort : undefined;
+  const rawEffort = typeof body.effort === "string" ? body.effort : undefined;
+
+  if (
+    rawReasoningEffort?.trim()
+    && rawEffort?.trim()
+    && rawReasoningEffort.trim().toLowerCase() !== rawEffort.trim().toLowerCase()
+  ) {
+    return {
+      error: "The reasoningEffort and effort fields must match when both are provided.",
+      status: 400,
+    };
+  }
+
+  const geminiSettings = parseGeminiOverrides(
+    typeof body.model === "string" ? body.model : undefined,
+    rawReasoningEffort ?? rawEffort,
+  );
+
+  if ("error" in geminiSettings) {
+    return { error: geminiSettings.error, status: 400 };
+  }
+
   return {
     additionalContext: typeof body.additionalContext === "string" && body.additionalContext.trim()
       ? body.additionalContext.trim()
       : null,
     inputMode: "url",
     iosCompatible: typeof body.iosCompatible === "boolean" ? body.iosCompatible : true,
+    model: geminiSettings.model,
     proxy: typeof body.proxy === "boolean" ? body.proxy : false,
     quality,
+    reasoningEffort: geminiSettings.reasoningEffort,
+    thinkingLevel: geminiSettings.thinkingLevel,
     url: parsedUrl.toString(),
   };
 }
@@ -470,7 +554,10 @@ async function parseMultipartFactCheckRequest(
       filename: string;
       inputMode: "file";
       mimeType: string;
+      model: SupportedGeminiModel;
+      reasoningEffort: ReasoningEffort;
       sizeBytes: number;
+      thinkingLevel: ThinkingLevel;
       url: string | null;
     }
   | { error: string; status: 400 | 413 }
@@ -529,6 +616,47 @@ async function parseMultipartFactCheckRequest(
     return { error: "The additionalContext field must be a string when provided.", status: 400 };
   }
 
+  const modelEntry = formData.get("model");
+
+  if (modelEntry !== null && typeof modelEntry !== "string") {
+    return { error: "The model field must be a string when provided.", status: 400 };
+  }
+
+  const reasoningEffortEntry = formData.get("reasoningEffort");
+
+  if (reasoningEffortEntry !== null && typeof reasoningEffortEntry !== "string") {
+    return { error: "The reasoningEffort field must be a string when provided.", status: 400 };
+  }
+
+  const effortEntry = formData.get("effort");
+
+  if (effortEntry !== null && typeof effortEntry !== "string") {
+    return { error: "The effort field must be a string when provided.", status: 400 };
+  }
+
+  if (
+    typeof reasoningEffortEntry === "string"
+    && reasoningEffortEntry.trim()
+    && typeof effortEntry === "string"
+    && effortEntry.trim()
+    && reasoningEffortEntry.trim().toLowerCase() !== effortEntry.trim().toLowerCase()
+  ) {
+    return {
+      error: "The reasoningEffort and effort fields must match when both are provided.",
+      status: 400,
+    };
+  }
+
+  const geminiSettings = parseGeminiOverrides(
+    typeof modelEntry === "string" ? modelEntry : undefined,
+    (typeof reasoningEffortEntry === "string" ? reasoningEffortEntry : undefined)
+      ?? (typeof effortEntry === "string" ? effortEntry : undefined),
+  );
+
+  if ("error" in geminiSettings) {
+    return { error: geminiSettings.error, status: 400 };
+  }
+
   const arrayBuffer = await fileEntry.arrayBuffer();
   const bytes = new Uint8Array(arrayBuffer);
 
@@ -547,7 +675,10 @@ async function parseMultipartFactCheckRequest(
     filename: fileEntry.name || `${createRequestId()}.mp4`,
     inputMode: "file",
     mimeType,
+    model: geminiSettings.model,
+    reasoningEffort: geminiSettings.reasoningEffort,
     sizeBytes: bytes.byteLength,
+    thinkingLevel: geminiSettings.thinkingLevel,
     url: sourceUrl,
   };
 }
@@ -677,16 +808,19 @@ async function createSearchPlan(
   requestId: string,
   videoInput: InlineVideoInput,
   prompt: string,
+  geminiSettings: GeminiRequestSettings,
 ): Promise<SearchPlan> {
   logEvent(requestId, "search_plan_started", {
     queryCount: exaSearchQueryCount,
     mimeType: videoInput.mimeType,
     sizeBytes: videoInput.sizeBytes,
-    thinkingLevel: ThinkingLevel.HIGH,
+    model: geminiSettings.model,
+    reasoningEffort: geminiSettings.reasoningEffort,
+    thinkingLevel: geminiSettings.thinkingLevel,
   });
 
   const response = await ai!.models.generateContent({
-    model: geminiModel,
+    model: geminiSettings.model,
     contents: [
       {
         inlineData: {
@@ -710,7 +844,7 @@ async function createSearchPlan(
       temperature: 0.2,
       thinkingConfig: {
         includeThoughts: false,
-        thinkingLevel: ThinkingLevel.HIGH,
+        thinkingLevel: geminiSettings.thinkingLevel,
       },
     },
   });
@@ -803,6 +937,63 @@ function parseJsonObject(rawText: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function parseGeminiOverrides(
+  rawModel: string | undefined,
+  rawReasoningEffort: string | undefined,
+): GeminiRequestSettings | { error: string } {
+  const model = rawModel?.trim() ? rawModel.trim() : defaultGeminiSettings.model;
+  const reasoningEffort = rawReasoningEffort?.trim().toLowerCase()
+    ? rawReasoningEffort.trim().toLowerCase()
+    : defaultGeminiSettings.reasoningEffort;
+
+  try {
+    return resolveGeminiSettings(model, reasoningEffort);
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "Invalid Gemini model or reasoningEffort.",
+    };
+  }
+}
+
+function resolveGeminiSettings(
+  rawModel: string,
+  rawReasoningEffort: string,
+): GeminiRequestSettings {
+  if (!isSupportedGeminiModel(rawModel)) {
+    throw new Error(
+      `The model field must be one of: ${supportedGeminiModels.join(", ")}.`,
+    );
+  }
+
+  if (!isReasoningEffort(rawReasoningEffort)) {
+    throw new Error(
+      `The reasoningEffort field must be one of: ${supportedReasoningEfforts.join(", ")}.`,
+    );
+  }
+
+  const supportedEfforts = supportedReasoningEffortsByModel[rawModel];
+
+  if (!supportedEfforts.includes(rawReasoningEffort)) {
+    throw new Error(
+      `The reasoningEffort field must be one of: ${supportedEfforts.join(", ")} for model ${rawModel}.`,
+    );
+  }
+
+  return {
+    model: rawModel,
+    reasoningEffort: rawReasoningEffort,
+    thinkingLevel: thinkingLevelByReasoningEffort[rawReasoningEffort],
+  };
+}
+
+function isSupportedGeminiModel(value: string): value is SupportedGeminiModel {
+  return supportedGeminiModels.includes(value as SupportedGeminiModel);
+}
+
+function isReasoningEffort(value: string): value is ReasoningEffort {
+  return supportedReasoningEfforts.includes(value as ReasoningEffort);
 }
 
 async function runExaSearches(requestId: string, searches: SearchQuery[]): Promise<SearchResultContext[]> {

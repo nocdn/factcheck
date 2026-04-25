@@ -17,8 +17,8 @@ When you send a URL, the API then:
 4. Sends the video to Gemini once to generate targeted Exa search queries.
 5. Runs those searches through Exa with full-text page returns.
 6. Sends the video and Exa search context to Gemini with:
-   - `gemini-3-flash-preview` by default
-   - high reasoning effort
+   - `gemini-3-flash-preview` by default, or a request override of `gemini-3-flash-preview` / `gemini-3.1-flash-lite-preview`
+   - the request's `reasoningEffort` when provided, otherwise `REASONING_EFFORT`
    - `text/plain` output
 7. Returns the plain-text fact-check result plus research sources, reasoning, and usage metadata.
 
@@ -61,7 +61,9 @@ JSON request body for URL mode:
   "quality": "1080p",
   "iosCompatible": true,
   "proxy": false,
-  "additionalContext": "Pay extra attention to the health claims in the middle of the clip."
+  "additionalContext": "Pay extra attention to the health claims in the middle of the clip.",
+  "model": "gemini-3-flash-preview",
+  "effort": "high"
 }
 ```
 
@@ -72,12 +74,16 @@ Fields:
 - `iosCompatible` is optional and defaults to `true`.
 - `proxy` is optional and defaults to `false`.
 - `additionalContext` is optional extra instruction text appended to the fact-check prompt.
+- `model` is optional. Supported values are `gemini-3-flash-preview` and `gemini-3.1-flash-lite-preview`. If omitted, the API uses `GEMINI_MODEL`.
+- `reasoningEffort` is optional. `effort` is an alias for the same setting. Supported values are `minimal`, `low`, `medium`, and `high`. If both are provided they must match. If neither is provided, the API uses `REASONING_EFFORT`.
 
 Multipart form-data for file mode:
 
 - `file` is required and must be a video file.
 - `additionalContext` is optional.
 - `url` is optional and can be used to preserve the original public page URL in the response and prompt context.
+- `model` is optional and follows the same allowed values as JSON mode.
+- `reasoningEffort` is optional in multipart mode, and `effort` is an alias for it.
 
 Example:
 
@@ -85,6 +91,8 @@ Example:
 curl -X POST http://localhost:7110/api/check \
   -F "file=@/absolute/path/to/video.mp4" \
   -F "additionalContext=Pay extra attention to any medical claims." \
+  -F "model=gemini-3.1-flash-lite-preview" \
+  -F "effort=medium" \
   -F "url=https://www.tiktok.com/@example/video/123"
 ```
 
@@ -96,6 +104,7 @@ Successful response shape:
   "inputMode": "url",
   "url": "https://www.youtube.com/watch?v=VIDEO_ID",
   "model": "gemini-3-flash-preview",
+  "reasoningEffort": "high",
   "analysis": "Confidence: 7/10\n\nExplanation:\nOverall verdict sentence.\nSummary paragraph.\nDetailed fact-check paragraphs with inline citations like [1][2].\n\nSources:\n[1] - https://example.com/source\n\nSearches:\n(1) - example search query",
   "reasoning": "Optional Gemini thought text if returned by the API.",
   "download": {
@@ -141,7 +150,7 @@ Successful response shape:
 
 Common error cases:
 
-- `400` invalid request body or unsupported `quality`
+- `400` invalid request body or unsupported `quality`, `model`, `reasoningEffort`, or `effort`
 - `413` downloaded or uploaded video exceeds `INLINE_VIDEO_MAX_BYTES`
 - `502` upstream downloader, Exa, or Gemini failure
 - `504` upstream timeout
@@ -164,9 +173,16 @@ The prompt instructs Gemini to:
 
 The implementation enables:
 
-- `thinkingConfig.thinkingLevel = HIGH`
+- request-selectable `thinkingConfig.thinkingLevel` based on `reasoningEffort`
 - `thinkingConfig.includeThoughts = true`
 - `responseMimeType = "text/plain"`
+
+Supported Gemini request settings:
+
+- Models: `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
+- Reasoning effort: `minimal`, `low`, `medium`, `high` via `reasoningEffort` or `effort`
+
+If a request omits `model` or `reasoningEffort`, the API falls back to `GEMINI_MODEL` and `REASONING_EFFORT`.
 
 The server also emits verbose logs for each request, including request settings, downloader activity, generated Exa queries, Exa sources, Gemini request settings, finish reasons, token usage, returned analysis, and any thought text returned by the SDK.
 
@@ -182,7 +198,8 @@ All variables are optional unless marked required.
 | `HEALTH_RATE_LIMIT_WINDOW_MS` | Health endpoint rate limit window in ms | `500` |
 | `HEALTH_RATE_LIMIT_MAX` | Max requests per health window | `1` |
 | `GEMINI_API_KEY` | Gemini Developer API key | required for `/api/check` |
-| `GEMINI_MODEL` | Gemini model used for fact-checking | `gemini-3-flash-preview` |
+| `GEMINI_MODEL` | Default Gemini model used when the request body omits `model` | `gemini-3-flash-preview` |
+| `REASONING_EFFORT` | Default Gemini reasoning effort used when the request body omits `reasoningEffort` | `high` |
 | `GEMINI_TIMEOUT_MS` | Gemini request timeout in ms | `300000` |
 | `FACT_CHECK_MAX_OUTPUT_TOKENS` | Max output tokens requested from Gemini, including thinking tokens | `32768` |
 | `FACT_CHECK_SEARCH_PLAN_MAX_OUTPUT_TOKENS` | Max output tokens requested when Gemini plans Exa searches | `2048` |
