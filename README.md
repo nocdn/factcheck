@@ -206,6 +206,8 @@ Two separate limiters are configured:
 
 ## Docker
 
+The image copies `bun.lock` for reproducible `bun install` in the build. Keep `bun.lock` committed when you change dependencies.
+
 ```sh
 docker compose up --build
 ```

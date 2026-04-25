@@ -356,7 +356,7 @@ function parseBoundedIntegerEnv(name: string, fallback: number, minimum: number,
 }
 
 function createRequestId(): string {
-  return crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
