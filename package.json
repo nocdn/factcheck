@@ -6,6 +6,7 @@
     "start": "bun run src/index.ts"
   },
   "dependencies": {
+    "@google/genai": "^1.49.0",
     "hono": "latest",
     "hono-rate-limiter": "latest"
   },
