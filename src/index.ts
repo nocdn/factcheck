@@ -91,10 +91,14 @@ const factCheckSystemInstruction = [
   "Assess spoken claims, captions, on-screen text, visible documents, charts, and important visual context.",
   "Do not invent facts, sources, certainty, or quotes.",
   "If evidence is mixed, outdated, or incomplete, say so plainly.",
-  "The final fact-check must be plain text only with zero markdown of any kind; that is very important. No headers, no bold, no italics, no links in markdown, no backticks, no list markers except the citation format below.",
+  "The final fact-check must be plain text only with zero markdown of any kind; that is very important. No bold, no italics, no links in markdown, no backticks, no list markers except the citation format below.",
+  "Start the response with a confidence line exactly in this format: Confidence: X/10 where X is a whole number from 1 to 10.",
+  "That confidence score must be realistically calibrated to the quality, freshness, and completeness of the evidence. Avoid scores that are overly generous or overly harsh. Use middling scores when the evidence is mixed, incomplete, indirect, old, or somewhat uncertain, and reserve very high or very low confidence only for unusually strong or unusually weak evidence.",
+  "After the confidence line, add a blank line, then a line with exactly: Explanation:",
+  "Put the full fact-check explanation after Explanation: as plain text paragraphs.",
   "In the main analysis, cite sources using inline bracket numbers only, matching the Sources list at the end. For a single source use [1]. For multiple sources, repeat brackets with no commas or spaces between them, like [1][2][4][9]. Do not use one bracket with commas inside, such as [1, 2, 4, 9]. Use only the numbers 1, 2, and so on that you assign in the final Sources list.",
   "End the response with a final Sources: section: one line per source, in order, exactly like this: [1] - https://example.com/path (then [2] - https://... on the next line, and so on). No other format for that list.",
-  "After Sources:, add a final Searches: section listing every Exa search query that was performed, one raw query per line with no numbering or prefixes.",
+  "After Sources:, add a final Searches: section listing every Exa search query that was performed, one query per line in order, exactly like this: (1) - query text, then (2) - query text, and so on.",
   "If you cite a source in the text, it must appear in Sources with the same number and URL. Only include URLs you actually use from the Exa search context.",
 ].join(" ");
 
@@ -924,15 +928,18 @@ function buildFactCheckPrompt(url: string | null, additionalContext: string | nu
     "For origin stories, distinguish claims that are historically supported from claims that are merely widely repeated but uncertain.",
     "",
     "Output format requirements (very important): the entire response must be plain text with no markdown. No # headings, no asterisks for bold or italics, no backticks, no link syntax like square brackets for URLs, no blockquotes, no code fences, no tables.",
-    "Write one short overall verdict sentence first.",
+    "Start with a line exactly in this format: Confidence: X/10 where X is a whole number from 1 to 10.",
+    "Calibrate the confidence score realistically. Do not be overly generous or overly harsh. Use moderate scores for mixed or incomplete evidence, and reserve extreme scores for unusually strong or unusually weak evidence.",
+    "After that, add a blank line and then a line exactly: Explanation:",
+    "Under Explanation:, write one short overall verdict sentence first.",
     "Then write one short summary paragraph.",
     "Then cover each significant claim in plain text as continuous paragraphs, one after another, using [1] or [1][2] style references (adjacent brackets only) where evidence applies.",
     "For each claim, say whether it is true, false, misleading, missing context, or unverifiable, and explain why.",
     "Call out omitted context, outdated footage, manipulated framing, and mismatches between the visuals and the narration when present.",
-    "After the analysis, on its own, add a blank line, then a line with exactly: Sources:",
+    "After the explanation paragraphs, on its own, add a blank line, then a line with exactly: Sources:",
     "Then one line per cited source in order, each line exactly: [n] - https://full.url/path (for example: [1] - https://example.com/page )",
     "After the source lines, add a blank line, then a line with exactly: Searches:",
-    "Then list every Exa search query from the Exa searches performed section, one raw query per line, with no numbers, bullets, prefixes, or extra text.",
+    "Then list every Exa search query from the Exa searches performed section, one per line in order, exactly in this format: (1) - query text, (2) - query text, and so on, with no bullets or extra text.",
   ];
 
   if (url) {

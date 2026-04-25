@@ -96,7 +96,7 @@ Successful response shape:
   "inputMode": "url",
   "url": "https://www.youtube.com/watch?v=VIDEO_ID",
   "model": "gemini-3-flash-preview",
-  "analysis": "Plain text fact-check response from Gemini.",
+  "analysis": "Confidence: 7/10\n\nExplanation:\nOverall verdict sentence.\nSummary paragraph.\nDetailed fact-check paragraphs with inline citations like [1][2].\n\nSources:\n[1] - https://example.com/source\n\nSearches:\n(1) - example search query",
   "reasoning": "Optional Gemini thought text if returned by the API.",
   "download": {
     "apiUrl": "https://videos.bartoszbak.org/api/download",
@@ -158,7 +158,9 @@ The prompt instructs Gemini to:
 - avoid near-duplicate searches when possible while allowing overlap for very specific topics
 - distinguish historically supported origin claims from widely repeated but uncertain origin stories
 - call out false, misleading, missing-context, or unverifiable claims
-- return plain text only with no markdown, use inline references in the analysis (`[1]` for one source, `[1][2][3]` for several—adjacent brackets, not `[1, 2, 3]`), then end with `Sources:` (`[1] - https://...` one URL per line) followed by `Searches:` (one raw query per line)
+- start with a calibrated `Confidence: X/10` line using a realistic, non-extreme score unless the evidence clearly warrants it
+- add an `Explanation:` section with the verdict, summary, and detailed claim-by-claim analysis using inline references (`[1]` for one source, `[1][2][3]` for several—adjacent brackets, not `[1, 2, 3]`)
+- end with `Sources:` (`[1] - https://...` one URL per line) followed by `Searches:` (`(1) - query text`, `(2) - query text`, and so on)
 
 The implementation enables:
 
