@@ -17,10 +17,10 @@ When you send a URL, the API then:
 4. Sends the video to Gemini once to generate targeted Exa search queries.
 5. Runs those searches through Exa with full-text page returns.
 6. Sends the video and Exa search context to Gemini with:
-   - `gemini-3-flash-preview` by default, or a request override of `gemini-3-flash-preview` / `gemini-3.1-flash-lite-preview`
+   - `gemini-3-flash-preview` by default, or request overrides of `gemini-3-flash-preview` / `gemini-3.1-flash-lite-preview`
    - the request's `reasoningEffort` when provided, otherwise `REASONING_EFFORT`
    - `text/plain` output
-7. Returns the plain-text fact-check result plus research sources, reasoning, and usage metadata.
+7. Returns the plain-text fact-check result plus research sources, reasoning, and usage metadata, either in the same request or through a queued job depending on `mode`.
 
 When you send a direct file, the API skips the downloader completely and sends the uploaded video inline to Gemini.
 
@@ -49,7 +49,8 @@ The server listens on `http://localhost:7110` by default.
 | ------ | ---- | ----------- |
 | `GET` | `/api` | Basic service metadata |
 | `GET` | `/api/health` | Health check and Gemini config status |
-| `POST` | `/api/check` | Download a video, send it to Gemini, and return a fact-check |
+| `POST` | `/api/check` | Download a video, send it to Gemini, and return a fact-check directly or queue a background job |
+| `GET` | `/api/check/:jobId` | Poll a queued fact-check job |
 
 ## `POST /api/check`
 
@@ -63,7 +64,8 @@ JSON request body for URL mode:
   "proxy": false,
   "additionalContext": "Pay extra attention to the health claims in the middle of the clip.",
   "model": "gemini-3-flash-preview",
-  "effort": "high"
+  "effort": "high",
+  "mode": "direct"
 }
 ```
 
@@ -74,16 +76,28 @@ Fields:
 - `iosCompatible` is optional and defaults to `true`.
 - `proxy` is optional and defaults to `false`.
 - `additionalContext` is optional extra instruction text appended to the fact-check prompt.
-- `model` is optional. Supported values are `gemini-3-flash-preview` and `gemini-3.1-flash-lite-preview`. If omitted, the API uses `GEMINI_MODEL`.
+- `model` is optional. Supported values are `gemini-3-flash-preview` and `gemini-3.1-flash-lite-preview`. If omitted, the API uses `GEMINI_MODEL` for both Gemini steps. Send a string to use one model for both steps, or send a two-item array where the first model is used for the video watch/search-query planning step and the second model is used for the final answer synthesis step.
 - `reasoningEffort` is optional. `effort` is an alias for the same setting. Supported values are `minimal`, `low`, `medium`, and `high`. If both are provided they must match. If neither is provided, the API uses `REASONING_EFFORT`.
+- `mode` is optional and defaults to `direct`. Use `direct` to keep the HTTP request open until the fact-check is complete. Use `queue` to return an 8-digit job ID immediately and run the same fact-check in the background.
+
+Model array example:
+
+```json
+{
+  "url": "https://www.youtube.com/watch?v=VIDEO_ID",
+  "model": ["gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"],
+  "reasoningEffort": "high"
+}
+```
 
 Multipart form-data for file mode:
 
 - `file` is required and must be a video file.
 - `additionalContext` is optional.
 - `url` is optional and can be used to preserve the original public page URL in the response and prompt context.
-- `model` is optional and follows the same allowed values as JSON mode.
+- `model` is optional and follows the same allowed values as JSON mode. For multipart requests, pass the two-model form as a JSON array string, for example `["gemini-3-flash-preview","gemini-3.1-flash-lite-preview"]`.
 - `reasoningEffort` is optional in multipart mode, and `effort` is an alias for it.
+- `mode` is optional in multipart mode and follows the same `direct` or `queue` behavior as JSON mode.
 
 Example:
 
@@ -93,10 +107,11 @@ curl -X POST http://localhost:7110/api/check \
   -F "additionalContext=Pay extra attention to any medical claims." \
   -F "model=gemini-3.1-flash-lite-preview" \
   -F "effort=medium" \
+  -F "mode=direct" \
   -F "url=https://www.tiktok.com/@example/video/123"
 ```
 
-Successful response shape:
+Successful direct response shape:
 
 ```json
 {
@@ -104,6 +119,10 @@ Successful response shape:
   "inputMode": "url",
   "url": "https://www.youtube.com/watch?v=VIDEO_ID",
   "model": "gemini-3-flash-preview",
+  "models": {
+    "searchPlan": "gemini-3-flash-preview",
+    "finalAnswer": "gemini-3-flash-preview"
+  },
   "reasoningEffort": "high",
   "analysis": "Confidence: 7/10\n\nExplanation:\nOverall verdict sentence.\nSummary paragraph.\nDetailed fact-check paragraphs with inline citations like [1][2].\n\nSources:\n[1] - https://example.com/source\n\nSearches:\n(1) - example search query",
   "reasoning": "Optional Gemini thought text if returned by the API.",
@@ -148,11 +167,74 @@ Successful response shape:
 }
 ```
 
+Queued request example:
+
+```bash
+curl -X POST http://localhost:7110/api/check \
+  -H "content-type: application/json" \
+  -d '{
+    "url": "https://www.youtube.com/watch?v=VIDEO_ID",
+    "mode": "queue",
+    "model": ["gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"],
+    "reasoningEffort": "high"
+  }'
+```
+
+Queued response shape:
+
+```json
+{
+  "id": "12345678",
+  "ready": false
+}
+```
+
+Poll the job with:
+
+```bash
+curl http://localhost:7110/api/check/12345678
+```
+
+If the job is still processing, the API returns:
+
+```json
+{
+  "id": "12345678",
+  "ready": false
+}
+```
+
+If the job is complete, the API returns `ready: true` plus the same fact-check JSON fields returned by direct mode:
+
+```json
+{
+  "ready": true,
+  "id": "12345678",
+  "inputMode": "url",
+  "url": "https://www.youtube.com/watch?v=VIDEO_ID",
+  "model": ["gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"],
+  "models": {
+    "searchPlan": "gemini-3-flash-preview",
+    "finalAnswer": "gemini-3.1-flash-lite-preview"
+  },
+  "reasoningEffort": "high",
+  "analysis": "Confidence: 7/10\n\nExplanation:\n...",
+  "reasoning": null,
+  "download": {},
+  "uploadedFile": null,
+  "research": {},
+  "usage": {},
+  "warnings": []
+}
+```
+
 Common error cases:
 
 - `400` invalid request body or unsupported `quality`, `model`, `reasoningEffort`, or `effort`
+- `404` unknown queued job ID
 - `413` downloaded or uploaded video exceeds `INLINE_VIDEO_MAX_BYTES`
 - `502` upstream downloader, Exa, or Gemini failure
+- `503` Gemini remains unavailable after high-demand retries
 - `504` upstream timeout
 - `500` missing Gemini configuration or unexpected server error
 
@@ -176,15 +258,20 @@ The implementation enables:
 - request-selectable `thinkingConfig.thinkingLevel` based on `reasoningEffort`
 - `thinkingConfig.includeThoughts = true`
 - `responseMimeType = "text/plain"`
+- separate request-selectable Gemini models for the search-planning step and final-answer step when `model` is a two-item array
+- a configurable delay before the final Gemini synthesis request, defaulting to 10 seconds
+- two automatic retries by default when Gemini returns the temporary high-demand 503 response
 
 Supported Gemini request settings:
 
-- Models: `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`
+- Models: `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview`. Use a single string for both Gemini calls, or `[searchPlanningModel, finalAnswerModel]` to split them by step.
 - Reasoning effort: `minimal`, `low`, `medium`, `high` via `reasoningEffort` or `effort`
 
-If a request omits `model` or `reasoningEffort`, the API falls back to `GEMINI_MODEL` and `REASONING_EFFORT`.
+If a request omits `model` or `reasoningEffort`, the API falls back to `GEMINI_MODEL` and `REASONING_EFFORT`. The same reasoning effort is used for both Gemini calls.
 
 The server also emits verbose logs for each request, including request settings, downloader activity, generated Exa queries, Exa sources, Gemini request settings, finish reasons, token usage, returned analysis, and any thought text returned by the SDK.
+
+If Gemini returns a temporary high-demand 503, the API waits `GEMINI_HIGH_DEMAND_RETRY_DELAY_MS` and retries up to `GEMINI_HIGH_DEMAND_RETRY_COUNT` times. If all retries fail, direct mode returns `503`; queued mode stores the failed job and polling returns `ready: true` with the error.
 
 ## Environment variables
 
@@ -201,6 +288,9 @@ All variables are optional unless marked required.
 | `GEMINI_MODEL` | Default Gemini model used when the request body omits `model` | `gemini-3-flash-preview` |
 | `REASONING_EFFORT` | Default Gemini reasoning effort used when the request body omits `reasoningEffort` | `high` |
 | `GEMINI_TIMEOUT_MS` | Gemini request timeout in ms | `300000` |
+| `GEMINI_STEP_DELAY_MS` | Delay before the final Gemini synthesis request, after search planning and Exa search complete | `10000` |
+| `GEMINI_HIGH_DEMAND_RETRY_COUNT` | Number of retries for temporary Gemini high-demand 503 responses | `2` |
+| `GEMINI_HIGH_DEMAND_RETRY_DELAY_MS` | Delay before each Gemini high-demand retry in ms | `10000` |
 | `FACT_CHECK_MAX_OUTPUT_TOKENS` | Max output tokens requested from Gemini, including thinking tokens | `32768` |
 | `FACT_CHECK_SEARCH_PLAN_MAX_OUTPUT_TOKENS` | Max output tokens requested when Gemini plans Exa searches | `2048` |
 | `EXA_API_KEY` | Exa API key used for web evidence searches | required for `/api/check` |

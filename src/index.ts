@@ -23,6 +23,9 @@ const factCheckDownloadQuality = process.env.FACT_CHECK_DEFAULT_QUALITY?.trim() 
 const inlineVideoMaxBytes = parseIntegerEnv("INLINE_VIDEO_MAX_BYTES", 18 * 1024 * 1024);
 const downloadTimeoutMs = parseIntegerEnv("VIDEO_DOWNLOAD_TIMEOUT_MS", 120_000);
 const geminiTimeoutMs = parseIntegerEnv("GEMINI_TIMEOUT_MS", 300_000);
+const geminiStepDelayMs = parseNonNegativeIntegerEnv("GEMINI_STEP_DELAY_MS", 10_000);
+const geminiHighDemandRetryCount = parseNonNegativeIntegerEnv("GEMINI_HIGH_DEMAND_RETRY_COUNT", 2);
+const geminiHighDemandRetryDelayMs = parseNonNegativeIntegerEnv("GEMINI_HIGH_DEMAND_RETRY_DELAY_MS", 10_000);
 const factCheckMaxOutputTokens = parseIntegerEnv("FACT_CHECK_MAX_OUTPUT_TOKENS", 32_768);
 const searchPlanMaxOutputTokens = parseIntegerEnv("FACT_CHECK_SEARCH_PLAN_MAX_OUTPUT_TOKENS", 2_048);
 const defaultGeminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-3-flash-preview";
@@ -66,12 +69,18 @@ const thinkingLevelByReasoningEffort: Record<ReasoningEffort, ThinkingLevel> = {
 };
 
 type GeminiRequestSettings = {
-  model: SupportedGeminiModel;
+  model: SupportedGeminiModel | [SupportedGeminiModel, SupportedGeminiModel];
+  models: {
+    finalAnswer: SupportedGeminiModel;
+    searchPlan: SupportedGeminiModel;
+  };
   reasoningEffort: ReasoningEffort;
   thinkingLevel: ThinkingLevel;
 };
 
 const defaultGeminiSettings = resolveGeminiSettings(defaultGeminiModel, defaultReasoningEffort);
+
+type RequestMode = "direct" | "queue";
 
 type UrlFactCheckInput = {
   iosCompatible: boolean;
@@ -118,6 +127,106 @@ type InlineVideoInput = {
   mimeType: string;
   sizeBytes: number;
 };
+
+type ParsedFactCheckRequest =
+  | {
+      additionalContext: string | null;
+      inputMode: "url";
+      iosCompatible: boolean;
+      mode: RequestMode;
+      model: SupportedGeminiModel | [SupportedGeminiModel, SupportedGeminiModel];
+      models: GeminiRequestSettings["models"];
+      proxy: boolean;
+      quality: string;
+      reasoningEffort: ReasoningEffort;
+      thinkingLevel: ThinkingLevel;
+      url: string;
+    }
+  | {
+      additionalContext: string | null;
+      bytes: Uint8Array;
+      filename: string;
+      inputMode: "file";
+      mimeType: string;
+      mode: RequestMode;
+      model: SupportedGeminiModel | [SupportedGeminiModel, SupportedGeminiModel];
+      models: GeminiRequestSettings["models"];
+      reasoningEffort: ReasoningEffort;
+      sizeBytes: number;
+      thinkingLevel: ThinkingLevel;
+      url: string | null;
+    };
+
+type FactCheckResponse = {
+  id: string;
+  inputMode: "url" | "file";
+  url: string | null;
+  model: SupportedGeminiModel | [SupportedGeminiModel, SupportedGeminiModel];
+  models: GeminiRequestSettings["models"];
+  reasoningEffort: ReasoningEffort;
+  analysis: string;
+  reasoning: string | null;
+  download: {
+    apiUrl: string;
+    filename: string;
+    mimeType: string;
+    quality: string;
+    requestedQuality: string;
+    sizeBytes: number;
+    iosCompatible: boolean;
+    proxy: boolean;
+  } | null;
+  uploadedFile: {
+    filename: string;
+    mimeType: string;
+    sizeBytes: number;
+  } | null;
+  research: {
+    provider: "exa";
+    searchType: string;
+    queries: SearchQuery[];
+    results: Array<{
+      query: string;
+      title: string | null;
+      url: string;
+      publishedDate: string | null;
+      author: string | null;
+    }>;
+  };
+  usage: {
+    promptTokenCount: number | null;
+    candidatesTokenCount: number | null;
+    thoughtsTokenCount: number | null;
+    toolUsePromptTokenCount: number | null;
+    totalTokenCount: number | null;
+  } | null;
+  warnings: string[];
+};
+
+type FactCheckJob =
+  | {
+      createdAt: number;
+      status: "processing";
+    }
+  | {
+      createdAt: number;
+      completedAt: number;
+      result: FactCheckResponse;
+      status: "completed";
+    }
+  | {
+      createdAt: number;
+      completedAt: number;
+      error: string;
+      status: "failed";
+      statusCode: ErrorStatus;
+    };
+
+const factCheckJobs = new Map<string, FactCheckJob>();
+
+type GeminiGenerateContentRequest = Parameters<GoogleGenAI["models"]["generateContent"]>[0];
+type GeminiGenerateContentResponse = Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>;
+type ErrorStatus = 400 | 413 | 429 | 500 | 502 | 503 | 504;
 
 const factCheckSystemInstruction = [
   "You are a meticulous video fact-checking analyst.",
@@ -168,6 +277,7 @@ app.get("/api/health", healthLimiter, (c) => {
     geminiConfigured: Boolean(geminiApiKey),
     exaConfigured: Boolean(exaApiKey),
     model: defaultGeminiSettings.model,
+    models: defaultGeminiSettings.models,
     reasoningEffort: defaultGeminiSettings.reasoningEffort,
   });
 });
@@ -177,9 +287,39 @@ app.get("/api", (c) => {
     name: "factcheck",
     status: "ok",
     port,
-    routes: ["/api/health", "/api/check"],
+    routes: ["/api/health", "/api/check", "/api/check/:jobId"],
     model: defaultGeminiSettings.model,
+    models: defaultGeminiSettings.models,
     reasoningEffort: defaultGeminiSettings.reasoningEffort,
+  });
+});
+
+app.get("/api/check/:jobId", (c) => {
+  const jobId = c.req.param("jobId");
+  const job = factCheckJobs.get(jobId);
+
+  if (!job) {
+    return c.json({ error: "Job not found." }, 404);
+  }
+
+  if (job.status === "processing") {
+    return c.json({ id: jobId, ready: false });
+  }
+
+  if (job.status === "failed") {
+    return c.json(
+      {
+        id: jobId,
+        ready: true,
+        error: job.error,
+      },
+      job.statusCode,
+    );
+  }
+
+  return c.json({
+    ready: true,
+    ...job.result,
   });
 });
 
@@ -208,8 +348,9 @@ app.post("/api/check", async (c) => {
     return c.json({ error: parsedBody.error }, parsedBody.status);
   }
 
-  const requestId = createRequestId();
+  const requestId = parsedBody.mode === "queue" ? createJobId() : createRequestId();
   logEvent(requestId, "fact_check_request_received", {
+    requestMode: parsedBody.mode,
     inputMode: parsedBody.inputMode,
     url: parsedBody.url,
     filename: parsedBody.inputMode === "file" ? parsedBody.filename : null,
@@ -221,52 +362,110 @@ app.post("/api/check", async (c) => {
     additionalContextLength: parsedBody.additionalContext?.length ?? 0,
     inlineVideoMaxBytes,
     geminiModel: parsedBody.model,
+    geminiModels: parsedBody.models,
     reasoningEffort: parsedBody.reasoningEffort,
   });
 
-  try {
-    const videoInput = parsedBody.inputMode === "url"
-      ? await downloadVideoForInlineUse(requestId, parsedBody)
-      : {
-          bytes: parsedBody.bytes,
-          filename: parsedBody.filename,
-          mimeType: parsedBody.mimeType,
-          sizeBytes: parsedBody.sizeBytes,
-        };
+  if (parsedBody.mode === "queue") {
+    factCheckJobs.set(requestId, {
+      createdAt: Date.now(),
+      status: "processing",
+    });
 
-    if (parsedBody.inputMode === "file") {
-      logEvent(requestId, "video_upload_received", {
+    runQueuedFactCheck(requestId, parsedBody);
+
+    return c.json({
+      id: requestId,
+      ready: false,
+    });
+  }
+
+  try {
+    return c.json(await runFactCheck(requestId, parsedBody));
+  } catch (error) {
+    console.error(`[fact-check:${requestId}]`, error);
+    return handleFactCheckError(error);
+  }
+});
+
+const server = Bun.serve({
+  fetch: app.fetch,
+  port,
+});
+
+console.log(`Listening on http://localhost:${server.port}`);
+
+async function runQueuedFactCheck(requestId: string, input: ParsedFactCheckRequest): Promise<void> {
+  try {
+    const result = await runFactCheck(requestId, input);
+    factCheckJobs.set(requestId, {
+      completedAt: Date.now(),
+      createdAt: factCheckJobs.get(requestId)?.createdAt ?? Date.now(),
+      result,
+      status: "completed",
+    });
+  } catch (error) {
+    console.error(`[fact-check:${requestId}]`, error);
+    const normalized = normalizeFactCheckError(error);
+    factCheckJobs.set(requestId, {
+      completedAt: Date.now(),
+      createdAt: factCheckJobs.get(requestId)?.createdAt ?? Date.now(),
+      error: normalized.error,
+      status: "failed",
+      statusCode: normalized.status,
+    });
+  }
+}
+
+async function runFactCheck(requestId: string, parsedBody: ParsedFactCheckRequest): Promise<FactCheckResponse> {
+  const videoInput = parsedBody.inputMode === "url"
+    ? await downloadVideoForInlineUse(requestId, parsedBody)
+    : {
+        bytes: parsedBody.bytes,
         filename: parsedBody.filename,
         mimeType: parsedBody.mimeType,
         sizeBytes: parsedBody.sizeBytes,
-        sourceUrl: parsedBody.url,
-      });
-    }
+      };
 
-    const prompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext);
-    const searchPlan = await createSearchPlan(requestId, videoInput, prompt, parsedBody);
-    const searchResults = await runExaSearches(requestId, searchPlan.searches);
-    const searchContext = buildSearchContext(searchResults, searchPlan.searches);
-    const finalPrompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext, searchContext);
-
-    logEvent(requestId, "gemini_request_prepared", {
-      inputMode: parsedBody.inputMode,
+  if (parsedBody.inputMode === "file") {
+    logEvent(requestId, "video_upload_received", {
+      filename: parsedBody.filename,
+      mimeType: parsedBody.mimeType,
+      sizeBytes: parsedBody.sizeBytes,
       sourceUrl: parsedBody.url,
-      mimeType: videoInput.mimeType,
-      sizeBytes: videoInput.sizeBytes,
-      filename: videoInput.filename,
-      systemInstructionPreview: truncate(factCheckSystemInstruction, 300),
-      promptPreview: truncate(finalPrompt, 500),
-      responseMimeType: "text/plain",
-      thinkingLevel: parsedBody.thinkingLevel,
-      exaSearchEnabled: true,
-      exaSearchQueryCount: searchPlan.searches.length,
-      exaSearchResultCount: searchResults.length,
-      includeThoughts: true,
     });
+  }
 
-    const response = await ai.models.generateContent({
-      model: parsedBody.model,
+  const prompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext);
+  const searchPlan = await createSearchPlan(requestId, videoInput, prompt, parsedBody);
+  const searchResults = await runExaSearches(requestId, searchPlan.searches);
+  const searchContext = buildSearchContext(searchResults, searchPlan.searches);
+  const finalPrompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext, searchContext);
+
+  await delayBeforeGeminiStep(requestId, "final_answer");
+
+  logEvent(requestId, "gemini_request_prepared", {
+    inputMode: parsedBody.inputMode,
+    sourceUrl: parsedBody.url,
+    mimeType: videoInput.mimeType,
+    sizeBytes: videoInput.sizeBytes,
+    filename: videoInput.filename,
+    systemInstructionPreview: truncate(factCheckSystemInstruction, 300),
+    promptPreview: truncate(finalPrompt, 500),
+    responseMimeType: "text/plain",
+    thinkingLevel: parsedBody.thinkingLevel,
+    geminiModel: parsedBody.models.finalAnswer,
+    exaSearchEnabled: true,
+    exaSearchQueryCount: searchPlan.searches.length,
+    exaSearchResultCount: searchResults.length,
+    includeThoughts: true,
+  });
+
+  const response = await generateGeminiContentWithRetry(
+    requestId,
+    "final_answer",
+    {
+      model: parsedBody.models.finalAnswer,
       contents: [
         {
           inlineData: {
@@ -289,102 +488,93 @@ app.post("/api/check", async (c) => {
           thinkingLevel: parsedBody.thinkingLevel,
         },
       },
-    });
+    },
+  );
 
-    const analysis = response.text?.trim() || "";
+  const analysis = response.text?.trim() || "";
 
-    if (!analysis) {
-      return c.json({ error: "Gemini returned an empty response." }, 502);
-    }
+  if (!analysis) {
+    throw new HttpError(502, "Gemini returned an empty response.");
+  }
 
-    const candidate = response.candidates?.[0];
-    const reasoning = extractThoughtText(candidate?.content?.parts);
-    const warnings = buildWarnings(searchPlan.searches, searchResults);
+  const candidate = response.candidates?.[0];
+  const reasoning = extractThoughtText(candidate?.content?.parts);
+  const warnings = buildWarnings(searchPlan.searches, searchResults);
 
-    logEvent(requestId, "gemini_response_received", {
-      responseId: response.responseId ?? null,
-      modelVersion: response.modelVersion ?? null,
-      finishReason: candidate?.finishReason ?? null,
-      finishMessage: candidate?.finishMessage ?? null,
-      promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
-      candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
-      thoughtsTokenCount: response.usageMetadata?.thoughtsTokenCount ?? null,
-      toolUsePromptTokenCount: response.usageMetadata?.toolUsePromptTokenCount ?? null,
-      totalTokenCount: response.usageMetadata?.totalTokenCount ?? null,
-      exaSearchQueries: searchPlan.searches,
-      exaSources: searchResults.map((result) => ({
+  logEvent(requestId, "gemini_response_received", {
+    responseId: response.responseId ?? null,
+    modelVersion: response.modelVersion ?? null,
+    finishReason: candidate?.finishReason ?? null,
+    finishMessage: candidate?.finishMessage ?? null,
+    promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
+    candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
+    thoughtsTokenCount: response.usageMetadata?.thoughtsTokenCount ?? null,
+    toolUsePromptTokenCount: response.usageMetadata?.toolUsePromptTokenCount ?? null,
+    totalTokenCount: response.usageMetadata?.totalTokenCount ?? null,
+    exaSearchQueries: searchPlan.searches,
+    exaSources: searchResults.map((result) => ({
+      query: result.query,
+      title: result.title,
+      uri: result.url,
+      publishedDate: result.publishedDate,
+    })),
+    reasoningPreview: reasoning ? truncate(reasoning, 3000) : null,
+    analysisPreview: truncate(analysis, 5000),
+    warnings,
+  });
+
+  return {
+    id: requestId,
+    inputMode: parsedBody.inputMode,
+    url: parsedBody.url,
+    model: parsedBody.model,
+    models: parsedBody.models,
+    reasoningEffort: parsedBody.reasoningEffort,
+    analysis,
+    reasoning,
+    download: parsedBody.inputMode === "url"
+      ? {
+          apiUrl: videoDownloadApiUrl,
+          filename: videoInput.filename,
+          mimeType: videoInput.mimeType,
+          quality: "quality" in videoInput ? videoInput.quality : parsedBody.quality,
+          requestedQuality: parsedBody.quality,
+          sizeBytes: videoInput.sizeBytes,
+          iosCompatible: parsedBody.iosCompatible,
+          proxy: parsedBody.proxy,
+        }
+      : null,
+    uploadedFile: parsedBody.inputMode === "file"
+      ? {
+          filename: videoInput.filename,
+          mimeType: videoInput.mimeType,
+          sizeBytes: videoInput.sizeBytes,
+        }
+      : null,
+    research: {
+      provider: "exa",
+      searchType: exaSearchType,
+      queries: searchPlan.searches,
+      results: searchResults.map((result) => ({
         query: result.query,
         title: result.title,
-        uri: result.url,
+        url: result.url,
         publishedDate: result.publishedDate,
+        author: result.author,
       })),
-      reasoningPreview: reasoning ? truncate(reasoning, 3000) : null,
-      analysisPreview: truncate(analysis, 5000),
-      warnings,
-    });
-
-    return c.json({
-      id: requestId,
-      inputMode: parsedBody.inputMode,
-      url: parsedBody.url,
-      model: parsedBody.model,
-      reasoningEffort: parsedBody.reasoningEffort,
-      analysis,
-      reasoning,
-      download: parsedBody.inputMode === "url"
-        ? {
-            apiUrl: videoDownloadApiUrl,
-            filename: videoInput.filename,
-            mimeType: videoInput.mimeType,
-            quality: "quality" in videoInput ? videoInput.quality : parsedBody.quality,
-            requestedQuality: parsedBody.quality,
-            sizeBytes: videoInput.sizeBytes,
-            iosCompatible: parsedBody.iosCompatible,
-            proxy: parsedBody.proxy,
-          }
-        : null,
-      uploadedFile: parsedBody.inputMode === "file"
-        ? {
-            filename: videoInput.filename,
-            mimeType: videoInput.mimeType,
-            sizeBytes: videoInput.sizeBytes,
-          }
-        : null,
-      research: {
-        provider: "exa",
-        searchType: exaSearchType,
-        queries: searchPlan.searches,
-        results: searchResults.map((result) => ({
-          query: result.query,
-          title: result.title,
-          url: result.url,
-          publishedDate: result.publishedDate,
-          author: result.author,
-        })),
-      },
-      usage: response.usageMetadata
-        ? {
-            promptTokenCount: response.usageMetadata.promptTokenCount ?? null,
-            candidatesTokenCount: response.usageMetadata.candidatesTokenCount ?? null,
-            thoughtsTokenCount: response.usageMetadata.thoughtsTokenCount ?? null,
-            toolUsePromptTokenCount: response.usageMetadata.toolUsePromptTokenCount ?? null,
-            totalTokenCount: response.usageMetadata.totalTokenCount ?? null,
-          }
-        : null,
-      warnings,
-    });
-  } catch (error) {
-    console.error(`[fact-check:${requestId}]`, error);
-    return handleFactCheckError(error);
-  }
-});
-
-const server = Bun.serve({
-  fetch: app.fetch,
-  port,
-});
-
-console.log(`Listening on http://localhost:${server.port}`);
+    },
+    usage: response.usageMetadata
+      ? {
+          promptTokenCount: response.usageMetadata.promptTokenCount ?? null,
+          candidatesTokenCount: response.usageMetadata.candidatesTokenCount ?? null,
+          thoughtsTokenCount: response.usageMetadata.thoughtsTokenCount ?? null,
+          toolUsePromptTokenCount: response.usageMetadata.toolUsePromptTokenCount ?? null,
+          totalTokenCount: response.usageMetadata.totalTokenCount ?? null,
+        }
+      : null,
+    warnings,
+  };
+}
 
 function parseIntegerEnv(name: string, fallback: number): number {
   const value = process.env[name];
@@ -397,6 +587,10 @@ function parseIntegerEnv(name: string, fallback: number): number {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
+function parseNonNegativeIntegerEnv(name: string, fallback: number): number {
+  return Math.max(0, parseIntegerEnv(name, fallback));
+}
+
 function parseBoundedIntegerEnv(name: string, fallback: number, minimum: number, maximum: number): number {
   const value = parseIntegerEnv(name, fallback);
   return Math.min(Math.max(value, minimum), maximum);
@@ -406,38 +600,23 @@ function createRequestId(): string {
   return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
 }
 
+function createJobId(): string {
+  let jobId = "";
+
+  do {
+    jobId = crypto.getRandomValues(new Uint32Array(1))[0]!.toString().padStart(10, "0").slice(-8);
+  } while (factCheckJobs.has(jobId));
+
+  return jobId;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
 async function parseFactCheckRequest(
   request: Request,
-): Promise<
-  | {
-      additionalContext: string | null;
-      inputMode: "url";
-      iosCompatible: boolean;
-      model: SupportedGeminiModel;
-      proxy: boolean;
-      quality: string;
-      reasoningEffort: ReasoningEffort;
-      thinkingLevel: ThinkingLevel;
-      url: string;
-    }
-  | {
-      additionalContext: string | null;
-      bytes: Uint8Array;
-      filename: string;
-      inputMode: "file";
-      mimeType: string;
-      model: SupportedGeminiModel;
-      reasoningEffort: ReasoningEffort;
-      sizeBytes: number;
-      thinkingLevel: ThinkingLevel;
-      url: string | null;
-    }
-  | { error: string; status: 400 | 413 }
-> {
+): Promise<ParsedFactCheckRequest | { error: string; status: 400 | 413 }> {
   const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
 
   if (contentType.startsWith("multipart/form-data")) {
@@ -495,8 +674,16 @@ async function parseFactCheckRequest(
     return { error: "The additionalContext field must be a string when provided.", status: 400 };
   }
 
-  if (typeof body.model !== "undefined" && typeof body.model !== "string") {
-    return { error: "The model field must be a string when provided.", status: 400 };
+  if (
+    typeof body.model !== "undefined"
+    && typeof body.model !== "string"
+    && !Array.isArray(body.model)
+  ) {
+    return { error: "The model field must be a string or an array of two strings when provided.", status: 400 };
+  }
+
+  if (Array.isArray(body.model) && body.model.some((value) => typeof value !== "string")) {
+    return { error: "The model array must contain only strings.", status: 400 };
   }
 
   if (typeof body.reasoningEffort !== "undefined" && typeof body.reasoningEffort !== "string") {
@@ -505,6 +692,16 @@ async function parseFactCheckRequest(
 
   if (typeof body.effort !== "undefined" && typeof body.effort !== "string") {
     return { error: "The effort field must be a string when provided.", status: 400 };
+  }
+
+  if (typeof body.mode !== "undefined" && typeof body.mode !== "string") {
+    return { error: "The mode field must be a string when provided.", status: 400 };
+  }
+
+  const requestMode = parseRequestMode(typeof body.mode === "string" ? body.mode : undefined);
+
+  if ("error" in requestMode) {
+    return { error: requestMode.error, status: 400 };
   }
 
   const rawReasoningEffort = typeof body.reasoningEffort === "string" ? body.reasoningEffort : undefined;
@@ -522,7 +719,7 @@ async function parseFactCheckRequest(
   }
 
   const geminiSettings = parseGeminiOverrides(
-    typeof body.model === "string" ? body.model : undefined,
+    typeof body.model === "string" || Array.isArray(body.model) ? body.model : undefined,
     rawReasoningEffort ?? rawEffort,
   );
 
@@ -536,7 +733,9 @@ async function parseFactCheckRequest(
       : null,
     inputMode: "url",
     iosCompatible: typeof body.iosCompatible === "boolean" ? body.iosCompatible : true,
+    mode: requestMode.mode,
     model: geminiSettings.model,
+    models: geminiSettings.models,
     proxy: typeof body.proxy === "boolean" ? body.proxy : false,
     quality,
     reasoningEffort: geminiSettings.reasoningEffort,
@@ -547,21 +746,7 @@ async function parseFactCheckRequest(
 
 async function parseMultipartFactCheckRequest(
   request: Request,
-): Promise<
-  | {
-      additionalContext: string | null;
-      bytes: Uint8Array;
-      filename: string;
-      inputMode: "file";
-      mimeType: string;
-      model: SupportedGeminiModel;
-      reasoningEffort: ReasoningEffort;
-      sizeBytes: number;
-      thinkingLevel: ThinkingLevel;
-      url: string | null;
-    }
-  | { error: string; status: 400 | 413 }
-> {
+): Promise<ParsedFactCheckRequest | { error: string; status: 400 | 413 }> {
   let formData: FormData;
 
   try {
@@ -634,6 +819,18 @@ async function parseMultipartFactCheckRequest(
     return { error: "The effort field must be a string when provided.", status: 400 };
   }
 
+  const modeEntry = formData.get("mode");
+
+  if (modeEntry !== null && typeof modeEntry !== "string") {
+    return { error: "The mode field must be a string when provided.", status: 400 };
+  }
+
+  const requestMode = parseRequestMode(typeof modeEntry === "string" ? modeEntry : undefined);
+
+  if ("error" in requestMode) {
+    return { error: requestMode.error, status: 400 };
+  }
+
   if (
     typeof reasoningEffortEntry === "string"
     && reasoningEffortEntry.trim()
@@ -648,7 +845,7 @@ async function parseMultipartFactCheckRequest(
   }
 
   const geminiSettings = parseGeminiOverrides(
-    typeof modelEntry === "string" ? modelEntry : undefined,
+    parseMultipartModelEntry(modelEntry),
     (typeof reasoningEffortEntry === "string" ? reasoningEffortEntry : undefined)
       ?? (typeof effortEntry === "string" ? effortEntry : undefined),
   );
@@ -675,7 +872,9 @@ async function parseMultipartFactCheckRequest(
     filename: fileEntry.name || `${createRequestId()}.mp4`,
     inputMode: "file",
     mimeType,
+    mode: requestMode.mode,
     model: geminiSettings.model,
+    models: geminiSettings.models,
     reasoningEffort: geminiSettings.reasoningEffort,
     sizeBytes: bytes.byteLength,
     thinkingLevel: geminiSettings.thinkingLevel,
@@ -804,6 +1003,57 @@ function isUnavailableFormatError(errorText: string): boolean {
   return errorText.toLowerCase().includes("requested format is not available");
 }
 
+async function delayBeforeGeminiStep(requestId: string, step: string): Promise<void> {
+  if (geminiStepDelayMs <= 0) {
+    return;
+  }
+
+  logEvent(requestId, "gemini_step_delay_started", {
+    delayMs: geminiStepDelayMs,
+    step,
+  });
+  await delay(geminiStepDelayMs);
+}
+
+async function generateGeminiContentWithRetry(
+  requestId: string,
+  step: string,
+  request: GeminiGenerateContentRequest,
+): Promise<GeminiGenerateContentResponse> {
+  for (let attempt = 0; attempt <= geminiHighDemandRetryCount; attempt += 1) {
+    try {
+      return await ai!.models.generateContent({
+        ...request,
+        config: {
+          ...request.config,
+          abortSignal: AbortSignal.timeout(geminiTimeoutMs),
+        },
+      });
+    } catch (error) {
+      if (!isGeminiHighDemandError(error)) {
+        throw error;
+      }
+
+      if (attempt >= geminiHighDemandRetryCount) {
+        throw new HttpError(
+          503,
+          `Gemini is currently experiencing high demand. Retried ${geminiHighDemandRetryCount} ${geminiHighDemandRetryCount === 1 ? "time" : "times"} and the model is still unavailable. Please try again later.`,
+        );
+      }
+
+      logEvent(requestId, "gemini_high_demand_retry_scheduled", {
+        attempt: attempt + 1,
+        delayMs: geminiHighDemandRetryDelayMs,
+        maxRetries: geminiHighDemandRetryCount,
+        step,
+      });
+      await delay(geminiHighDemandRetryDelayMs);
+    }
+  }
+
+  throw new HttpError(503, "Gemini is currently unavailable. Please try again later.");
+}
+
 async function createSearchPlan(
   requestId: string,
   videoInput: InlineVideoInput,
@@ -814,40 +1064,44 @@ async function createSearchPlan(
     queryCount: exaSearchQueryCount,
     mimeType: videoInput.mimeType,
     sizeBytes: videoInput.sizeBytes,
-    model: geminiSettings.model,
+    model: geminiSettings.models.searchPlan,
     reasoningEffort: geminiSettings.reasoningEffort,
     thinkingLevel: geminiSettings.thinkingLevel,
   });
 
-  const response = await ai!.models.generateContent({
-    model: geminiSettings.model,
-    contents: [
-      {
-        inlineData: {
-          mimeType: videoInput.mimeType,
-          data: Buffer.from(videoInput.bytes).toString("base64"),
+  const response = await generateGeminiContentWithRetry(
+    requestId,
+    "search_plan",
+    {
+      model: geminiSettings.models.searchPlan,
+      contents: [
+        {
+          inlineData: {
+            mimeType: videoInput.mimeType,
+            data: Buffer.from(videoInput.bytes).toString("base64"),
+          },
+        },
+        {
+          text: buildSearchPlanningPrompt(prompt),
+        },
+      ],
+      config: {
+        abortSignal: AbortSignal.timeout(geminiTimeoutMs),
+        maxOutputTokens: searchPlanMaxOutputTokens,
+        responseMimeType: "application/json",
+        systemInstruction: [
+          "You are a fact-checking research planner.",
+          "Watch the supplied video and identify the claims that need outside verification.",
+          "Return only valid JSON matching the requested schema.",
+        ].join(" "),
+        temperature: 0.2,
+        thinkingConfig: {
+          includeThoughts: false,
+          thinkingLevel: geminiSettings.thinkingLevel,
         },
       },
-      {
-        text: buildSearchPlanningPrompt(prompt),
-      },
-    ],
-    config: {
-      abortSignal: AbortSignal.timeout(geminiTimeoutMs),
-      maxOutputTokens: searchPlanMaxOutputTokens,
-      responseMimeType: "application/json",
-      systemInstruction: [
-        "You are a fact-checking research planner.",
-        "Watch the supplied video and identify the claims that need outside verification.",
-        "Return only valid JSON matching the requested schema.",
-      ].join(" "),
-      temperature: 0.2,
-      thinkingConfig: {
-        includeThoughts: false,
-        thinkingLevel: geminiSettings.thinkingLevel,
-      },
     },
-  });
+  );
 
   const plan = parseSearchPlan(response.text ?? "");
 
@@ -939,16 +1193,45 @@ function parseJsonObject(rawText: string): Record<string, unknown> | null {
   }
 }
 
-function parseGeminiOverrides(
-  rawModel: string | undefined,
-  rawReasoningEffort: string | undefined,
-): GeminiRequestSettings | { error: string } {
-  const model = rawModel?.trim() ? rawModel.trim() : defaultGeminiSettings.model;
-  const reasoningEffort = rawReasoningEffort?.trim().toLowerCase()
-    ? rawReasoningEffort.trim().toLowerCase()
-    : defaultGeminiSettings.reasoningEffort;
+function parseRequestMode(rawMode: string | undefined): { mode: RequestMode } | { error: string } {
+  const mode = rawMode?.trim().toLowerCase() || "direct";
+
+  if (mode !== "direct" && mode !== "queue") {
+    return { error: "The mode field must be either direct or queue." };
+  }
+
+  return { mode };
+}
+
+function parseMultipartModelEntry(modelEntry: FormDataEntryValue | null): string | string[] | undefined {
+  if (typeof modelEntry !== "string") {
+    return undefined;
+  }
+
+  const trimmed = modelEntry.trim();
+
+  if (!trimmed.startsWith("[")) {
+    return modelEntry;
+  }
 
   try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return Array.isArray(parsed) ? parsed.map((value) => String(value)) : modelEntry;
+  } catch {
+    return modelEntry;
+  }
+}
+
+function parseGeminiOverrides(
+  rawModel: string | string[] | undefined,
+  rawReasoningEffort: string | undefined,
+): GeminiRequestSettings | { error: string } {
+  try {
+    const model = normalizeRequestedModel(rawModel);
+    const reasoningEffort = rawReasoningEffort?.trim().toLowerCase()
+      ? rawReasoningEffort.trim().toLowerCase()
+      : defaultGeminiSettings.reasoningEffort;
+
     return resolveGeminiSettings(model, reasoningEffort);
   } catch (error) {
     return {
@@ -958,33 +1241,83 @@ function parseGeminiOverrides(
 }
 
 function resolveGeminiSettings(
-  rawModel: string,
+  rawModel: SupportedGeminiModel | [SupportedGeminiModel, SupportedGeminiModel] | string | string[],
   rawReasoningEffort: string,
 ): GeminiRequestSettings {
-  if (!isSupportedGeminiModel(rawModel)) {
-    throw new Error(
-      `The model field must be one of: ${supportedGeminiModels.join(", ")}.`,
-    );
-  }
-
   if (!isReasoningEffort(rawReasoningEffort)) {
     throw new Error(
       `The reasoningEffort field must be one of: ${supportedReasoningEfforts.join(", ")}.`,
     );
   }
 
-  const supportedEfforts = supportedReasoningEffortsByModel[rawModel];
+  const models = resolveGeminiStepModels(rawModel);
+  const requestedModels = [models.searchPlan, models.finalAnswer];
 
-  if (!supportedEfforts.includes(rawReasoningEffort)) {
-    throw new Error(
-      `The reasoningEffort field must be one of: ${supportedEfforts.join(", ")} for model ${rawModel}.`,
-    );
+  for (const model of requestedModels) {
+    const supportedEfforts = supportedReasoningEffortsByModel[model];
+
+    if (!supportedEfforts.includes(rawReasoningEffort)) {
+      throw new Error(
+        `The reasoningEffort field must be one of: ${supportedEfforts.join(", ")} for model ${model}.`,
+      );
+    }
   }
 
   return {
-    model: rawModel,
+    model: models.searchPlan === models.finalAnswer ? models.searchPlan : [models.searchPlan, models.finalAnswer],
+    models,
     reasoningEffort: rawReasoningEffort,
     thinkingLevel: thinkingLevelByReasoningEffort[rawReasoningEffort],
+  };
+}
+
+function normalizeRequestedModel(
+  rawModel: string | string[] | undefined,
+): SupportedGeminiModel | [SupportedGeminiModel, SupportedGeminiModel] {
+  if (typeof rawModel === "undefined") {
+    return defaultGeminiSettings.model;
+  }
+
+  if (typeof rawModel === "string") {
+    const model = rawModel.trim() || defaultGeminiSettings.model;
+
+    if (!isSupportedGeminiModel(model)) {
+      throw new Error(`The model field must be one of: ${supportedGeminiModels.join(", ")}.`);
+    }
+
+    return model;
+  }
+
+  if (rawModel.length !== 2) {
+    throw new Error("The model array must contain exactly two model IDs: search planning, then final answer.");
+  }
+
+  const models = rawModel.map((model) => model.trim());
+
+  for (const model of models) {
+    if (!isSupportedGeminiModel(model)) {
+      throw new Error(`Each model array item must be one of: ${supportedGeminiModels.join(", ")}.`);
+    }
+  }
+
+  return [models[0] as SupportedGeminiModel, models[1] as SupportedGeminiModel];
+}
+
+function resolveGeminiStepModels(
+  rawModel: SupportedGeminiModel | [SupportedGeminiModel, SupportedGeminiModel] | string | string[],
+): GeminiRequestSettings["models"] {
+  const normalized = normalizeRequestedModel(Array.isArray(rawModel) ? rawModel : String(rawModel));
+
+  if (Array.isArray(normalized)) {
+    return {
+      searchPlan: normalized[0],
+      finalAnswer: normalized[1],
+    };
+  }
+
+  return {
+    searchPlan: normalized,
+    finalAnswer: normalized,
   };
 }
 
@@ -1203,6 +1536,41 @@ function extractThoughtText(parts: Part[] | undefined): string | null {
   return thoughts.join("\n\n");
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isGeminiHighDemandError(error: unknown): boolean {
+  const status = getErrorStatus(error);
+  const message = error instanceof Error ? error.message : JSON.stringify(error);
+
+  return status === 503
+    && (
+      message.toLowerCase().includes("high demand")
+      || message.includes("\"UNAVAILABLE\"")
+      || message.toLowerCase().includes("currently unavailable")
+    );
+}
+
+function getErrorStatus(error: unknown): number | null {
+  if (!isRecord(error)) {
+    return null;
+  }
+
+  const status = error.status;
+
+  if (typeof status === "number") {
+    return status;
+  }
+
+  if (typeof status === "string") {
+    const parsed = Number.parseInt(status, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+
+  return null;
+}
+
 function logEvent(requestId: string | null, event: string, payload: Record<string, unknown>): void {
   const prefix = requestId ? `[fact-check:${requestId}]` : "[fact-check]";
   console.log(`${prefix} ${event} ${JSON.stringify(payload)}`);
@@ -1213,19 +1581,40 @@ function truncate(value: string, maxLength: number): string {
 }
 
 function handleFactCheckError(error: unknown): Response {
+  const normalized = normalizeFactCheckError(error);
+  return Response.json({ error: normalized.error }, { status: normalized.status });
+}
+
+function normalizeFactCheckError(error: unknown): { error: string; status: ErrorStatus } {
   if (error instanceof HttpError) {
-    return Response.json({ error: error.message }, { status: error.status });
+    return {
+      error: error.message,
+      status: isSupportedErrorStatus(error.status) ? error.status : 500,
+    };
   }
 
   if (error instanceof DOMException && error.name === "TimeoutError") {
-    return Response.json({ error: "The upstream request timed out." }, { status: 504 });
+    return { error: "The upstream request timed out.", status: 504 };
+  }
+
+  const status = getErrorStatus(error);
+
+  if (status && isSupportedErrorStatus(status)) {
+    return {
+      error: error instanceof Error ? error.message : "The upstream request failed.",
+      status,
+    };
   }
 
   if (error instanceof Error) {
-    return Response.json({ error: error.message }, { status: 500 });
+    return { error: error.message, status: 500 };
   }
 
-  return Response.json({ error: "Unknown error." }, { status: 500 });
+  return { error: "Unknown error.", status: 500 };
+}
+
+function isSupportedErrorStatus(status: number): status is ErrorStatus {
+  return [400, 413, 429, 500, 502, 503, 504].includes(status);
 }
 
 class HttpError extends Error {
