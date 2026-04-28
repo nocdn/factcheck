@@ -94,6 +94,7 @@ JSON request body for URL mode:
   "additionalContext": "Pay extra attention to the health claims in the middle of the clip.",
   "model": "gemini-3-flash-preview",
   "effort": "high",
+  "searchType": "deep",
   "mode": "direct"
 }
 ```
@@ -108,6 +109,7 @@ Fields:
 - `additionalContext` is optional extra instruction text appended to the fact-check prompt.
 - `model` is optional. Supported values are `gemini-3-flash-preview` and `gemini-3.1-flash-lite-preview`. If omitted, the API uses `GEMINI_MODEL` for both Gemini steps. Send a string to use one model for both steps, or send a two-item array where the first model is used for search-query planning and the second model is used for final answer synthesis.
 - `reasoningEffort` is optional. `effort` is an alias for the same setting. Supported values are `minimal`, `low`, `medium`, and `high`. If both are provided they must match. If neither is provided, the API uses `REASONING_EFFORT`.
+- `searchType` is optional and defaults to `EXA_SEARCH_TYPE` (default `auto`). Controls the Exa search algorithm used for evidence retrieval. Supported aliases are `instant` (lowest latency), `deep` (deeper search), and `reasoning` (maps to Exa's `deep-reasoning`). You can also pass any raw Exa value directly: `auto`, `neural`, `fast`, `deep-lite`, `deep`, `deep-reasoning`, `instant`.
 - `mode` is optional and defaults to `direct`. Use `direct` to keep the HTTP request open until the fact-check is complete. Use `queue` to return an 8-digit job ID immediately and run the same fact-check in the background.
 
 Model array example:
@@ -127,6 +129,7 @@ Multipart form-data for file mode:
 - `url` is optional and can be used to preserve the original public page URL in the response and prompt context.
 - `model` is optional and follows the same allowed values as JSON mode. For multipart requests, pass the two-model form as a JSON array string, for example `["gemini-3-flash-preview","gemini-3.1-flash-lite-preview"]`.
 - `reasoningEffort` is optional in multipart mode, and `effort` is an alias for it.
+- `searchType` is optional in multipart mode and follows the same behavior as JSON mode.
 - `mode` is optional in multipart mode and follows the same `direct` or `queue` behavior as JSON mode.
 
 Example:
@@ -334,7 +337,7 @@ All variables are optional unless marked required.
 | `FACT_CHECK_MAX_OUTPUT_TOKENS` | Max output tokens requested from Gemini, including thinking tokens | `32768` |
 | `FACT_CHECK_SEARCH_PLAN_MAX_OUTPUT_TOKENS` | Max output tokens requested when Gemini plans Exa searches | `2048` |
 | `EXA_API_KEY` | Exa API key used for web evidence searches | required for `/api/check` |
-| `EXA_SEARCH_TYPE` | Exa search type used for generated queries | `auto` |
+| `EXA_SEARCH_TYPE` | Default Exa search type used when the request body omits `searchType`. Accepts `auto`, `neural`, `fast`, `deep-lite`, `deep`, `deep-reasoning`, `instant`, and the request aliases `instant`, `deep`, `reasoning` (which maps to `deep-reasoning`). | `auto` |
 | `SOCIALS_MAX_SEARCHES` | Max Exa searches Gemini may generate for social/video URL fact-checks, clamped from 1 to 10 | `5` |
 | `SOCIALS_RESULTS_PER_SEARCH` | Exa full-text results retrieved per social/video search, clamped from 1 to 10 | `5` |
 | `YOUTUBE_MAX_SEARCHES` | Max Exa searches Gemini may generate for YouTube transcript fact-checks, clamped from 1 to 20 | `10` |
