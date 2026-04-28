@@ -15,13 +15,23 @@ const videoDownloadApiUrl = process.env.VIDEO_DOWNLOAD_API_URL?.trim() || "https
 const geminiApiKey = process.env.GEMINI_API_KEY?.trim() || process.env.GOOGLE_API_KEY?.trim() || "";
 const exaApiKey = process.env.EXA_API_KEY?.trim() || "";
 const exaSearchType = process.env.EXA_SEARCH_TYPE?.trim() || "auto";
-const exaSearchQueryCount = parseBoundedIntegerEnv("EXA_SEARCH_QUERY_COUNT", 3, 1, 10);
-const exaResultsPerQuery = parseBoundedIntegerEnv("EXA_SEARCH_RESULTS_PER_QUERY", 6, 1, 10);
+const socialsMaxSearches = parseBoundedIntegerEnv("SOCIALS_MAX_SEARCHES", 5, 1, 10);
+const socialsResultsPerSearch = parseBoundedIntegerEnv("SOCIALS_RESULTS_PER_SEARCH", 5, 1, 10);
+const youtubeMaxSearches = parseBoundedIntegerEnv("YOUTUBE_MAX_SEARCHES", 10, 1, 20);
+const youtubeResultsPerSearch = parseBoundedIntegerEnv("YOUTUBE_RESULTS_PER_SEARCH", 3, 1, 10);
+const articleMaxSearches = parseBoundedIntegerEnv("ARTICLE_MAX_SEARCHES", 7, 1, 10);
+const articleResultsPerSearch = parseBoundedIntegerEnv("ARTICLE_RESULTS_PER_SEARCH", 4, 1, 10);
+const youtubeAudioQuality = process.env.YOUTUBE_AUDIO_QUALITY?.trim() || "low";
 const exaTextMaxCharacters = parseIntegerEnv("EXA_SEARCH_TEXT_MAX_CHARACTERS", 35_000);
 const exaTimeoutMs = parseIntegerEnv("EXA_SEARCH_TIMEOUT_MS", 60_000);
 const factCheckDownloadQuality = process.env.FACT_CHECK_DEFAULT_QUALITY?.trim() || "1080p";
 const inlineVideoMaxBytes = parseIntegerEnv("INLINE_VIDEO_MAX_BYTES", 18 * 1024 * 1024);
+const youtubeAudioMaxBytes = parseIntegerEnv("YOUTUBE_AUDIO_MAX_BYTES", 25 * 1024 * 1024);
 const downloadTimeoutMs = parseIntegerEnv("VIDEO_DOWNLOAD_TIMEOUT_MS", 120_000);
+const cohereApiKey = process.env.COHERE_API_KEY?.trim() || "";
+const cohereTranscribeModel = process.env.COHERE_TRANSCRIBE_MODEL?.trim() || "cohere-transcribe-03-2026";
+const cohereTranscribeLanguage = process.env.COHERE_TRANSCRIBE_LANGUAGE?.trim() || "en";
+const cohereTranscribeTimeoutMs = parseIntegerEnv("COHERE_TRANSCRIBE_TIMEOUT_MS", 300_000);
 const geminiTimeoutMs = parseIntegerEnv("GEMINI_TIMEOUT_MS", 300_000);
 const geminiStepDelayMs = parseNonNegativeIntegerEnv("GEMINI_STEP_DELAY_MS", 10_000);
 const geminiHighDemandRetryCount = parseNonNegativeIntegerEnv("GEMINI_HIGH_DEMAND_RETRY_COUNT", 2);
@@ -82,7 +92,12 @@ const defaultGeminiSettings = resolveGeminiSettings(defaultGeminiModel, defaultR
 
 type RequestMode = "direct" | "queue";
 
+type DownloadMode = "video" | "audio";
+type UrlProcessingMode = "video" | "transcript" | "webpage";
+type UrlSourceType = "auto" | "video" | "webpage";
+
 type UrlFactCheckInput = {
+  downloadMode: DownloadMode;
   iosCompatible: boolean;
   proxy: boolean;
   quality: string;
@@ -110,6 +125,19 @@ type ExaSearchResponse = {
   requestId?: string;
   results?: ExaSearchResult[];
   searchType?: string;
+};
+
+type ExaContentsResponse = {
+  requestId?: string;
+  results?: ExaSearchResult[];
+  statuses?: Array<{
+    error?: {
+      httpStatusCode?: number;
+      tag?: string;
+    };
+    id?: string;
+    status?: string;
+  }>;
 };
 
 type SearchResultContext = {
@@ -141,6 +169,8 @@ type ParsedFactCheckRequest =
       reasoningEffort: ReasoningEffort;
       thinkingLevel: ThinkingLevel;
       url: string;
+      urlMode: UrlProcessingMode;
+      useTranscript: boolean;
     }
   | {
       additionalContext: string | null;
@@ -180,6 +210,29 @@ type FactCheckResponse = {
     filename: string;
     mimeType: string;
     sizeBytes: number;
+  } | null;
+  transcription: {
+    provider: "cohere";
+    model: string;
+    language: string;
+    characterCount: number;
+    audio: {
+      apiUrl: string;
+      filename: string;
+      mimeType: string;
+      sizeBytes: number;
+      iosCompatible: boolean;
+      proxy: boolean;
+    };
+  } | null;
+  webpage: {
+    provider: "exa";
+    title: string | null;
+    url: string;
+    publishedDate: string | null;
+    author: string | null;
+    characterCount: number;
+    truncated: boolean;
   } | null;
   research: {
     provider: "exa";
@@ -228,24 +281,49 @@ type GeminiGenerateContentRequest = Parameters<GoogleGenAI["models"]["generateCo
 type GeminiGenerateContentResponse = Awaited<ReturnType<GoogleGenAI["models"]["generateContent"]>>;
 type ErrorStatus = 400 | 413 | 429 | 500 | 502 | 503 | 504;
 
-const factCheckSystemInstruction = [
-  "You are a meticulous video fact-checking analyst.",
-  "Use the provided video as the primary source of claims.",
-  "Use the provided Exa search results as supporting evidence.",
-  "Compare the video's claims against the search evidence before drawing conclusions.",
-  "Assess spoken claims, captions, on-screen text, visible documents, charts, and important visual context.",
-  "Do not invent facts, sources, certainty, or quotes.",
-  "If evidence is mixed, outdated, or incomplete, say so plainly.",
-  "The final fact-check must be plain text only with zero markdown of any kind; that is very important. No bold, no italics, no links in markdown, no backticks, no list markers except the citation format below.",
-  "Start the response with a confidence line exactly in this format: Confidence: X/10 where X is a whole number from 1 to 10.",
-  "That confidence score must be realistically calibrated to the quality, freshness, and completeness of the evidence. Avoid scores that are overly generous or overly harsh. Use middling scores when the evidence is mixed, incomplete, indirect, old, or somewhat uncertain, and reserve very high or very low confidence only for unusually strong or unusually weak evidence.",
-  "After the confidence line, add a blank line, then a line with exactly: Explanation:",
-  "Put the full fact-check explanation after Explanation: as plain text paragraphs.",
-  "In the main analysis, cite sources using inline bracket numbers only, matching the Sources list at the end. For a single source use [1]. For multiple sources, repeat brackets with no commas or spaces between them, like [1][2][4][9]. Do not use one bracket with commas inside, such as [1, 2, 4, 9]. Use only the numbers 1, 2, and so on that you assign in the final Sources list.",
-  "End the response with a final Sources: section: one line per source, in order, exactly like this: [1] - https://example.com/path (then [2] - https://... on the next line, and so on). No other format for that list.",
-  "After Sources:, add a final Searches: section listing every Exa search query that was performed, one query per line in order, exactly like this: (1) - query text, then (2) - query text, and so on.",
-  "If you cite a source in the text, it must appear in Sources with the same number and URL. Only include URLs you actually use from the Exa search context.",
-].join(" ");
+type FactCheckMode = "video" | "transcript" | "webpage";
+
+function buildSystemInstruction(mode: FactCheckMode): string {
+  const modeSpecific: Record<FactCheckMode, string[]> = {
+    video: [
+      "You are a meticulous video fact-checking analyst.",
+      "Use the provided video as the primary source of claims.",
+      "Use the provided Exa search results as supporting evidence.",
+      "Compare the video's claims against the search evidence before drawing conclusions.",
+      "Assess spoken claims, captions, on-screen text, visible documents, charts, and important visual context.",
+    ],
+    transcript: [
+      "You are a meticulous fact-checking analyst working from a YouTube video transcript.",
+      "Use the provided transcript as the primary source of claims.",
+      "Use the provided Exa search results as supporting evidence.",
+      "Compare the transcript's claims against the search evidence before drawing conclusions.",
+      "The transcript is automatically generated and may contain mishearings, missing punctuation, and proper-noun errors. If a claim hinges on a specific name or word that looks garbled, say so rather than inventing a corrected version.",
+    ],
+    webpage: [
+      "You are a meticulous fact-checking analyst working from an article or webpage.",
+      "Use the provided article text as the primary source of claims to check.",
+      "Use the provided Exa search results as independent supporting evidence.",
+      "Do not treat the article itself as evidence that its own claims are true.",
+      "Compare the article's claims against the search evidence before drawing conclusions.",
+    ],
+  };
+
+  const shared = [
+    "Do not invent facts, sources, certainty, or quotes.",
+    "If evidence is mixed, outdated, or incomplete, say so plainly.",
+    "The final fact-check must be plain text only with zero markdown of any kind; that is very important. No bold, no italics, no links in markdown, no backticks, no list markers except the citation format below.",
+    "Start the response with a confidence line exactly in this format: Confidence: X/10 where X is a whole number from 1 to 10.",
+    "That confidence score must be realistically calibrated to the quality, freshness, and completeness of the evidence. Avoid scores that are overly generous or overly harsh. Use middling scores when the evidence is mixed, incomplete, indirect, old, or somewhat uncertain, and reserve very high or very low confidence only for unusually strong or unusually weak evidence.",
+    "After the confidence line, add a blank line, then a line with exactly: Explanation:",
+    "Put the full fact-check explanation after Explanation: as plain text paragraphs.",
+    "In the main analysis, cite sources using inline bracket numbers only, matching the Sources list at the end. For a single source use [1]. For multiple sources, repeat brackets with no commas or spaces between them, like [1][2][4][9]. Do not use one bracket with commas inside, such as [1, 2, 4, 9]. Use only the numbers 1, 2, and so on that you assign in the final Sources list.",
+    "End the response with a final Sources: section: one line per source, in order, exactly like this: [1] - https://example.com/path (then [2] - https://... on the next line, and so on). No other format for that list.",
+    "After Sources:, add a final Searches: section listing every Exa search query that was performed, one query per line in order, exactly like this: (1) - query text, then (2) - query text, and so on.",
+    "If you cite a source in the text, it must appear in Sources with the same number and URL. Only include URLs you actually use from the Exa search context.",
+  ];
+
+  return [...modeSpecific[mode], ...shared].join(" ");
+}
 
 const app = new Hono();
 const ai = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
@@ -276,6 +354,7 @@ app.get("/api/health", healthLimiter, (c) => {
     status: "ok",
     geminiConfigured: Boolean(geminiApiKey),
     exaConfigured: Boolean(exaApiKey),
+    cohereConfigured: Boolean(cohereApiKey),
     model: defaultGeminiSettings.model,
     models: defaultGeminiSettings.models,
     reasoningEffort: defaultGeminiSettings.reasoningEffort,
@@ -348,6 +427,15 @@ app.post("/api/check", async (c) => {
     return c.json({ error: parsedBody.error }, parsedBody.status);
   }
 
+  if (parsedBody.inputMode === "url" && parsedBody.urlMode === "transcript" && !cohereApiKey) {
+    return c.json(
+      {
+        error: "Cohere is not configured. Set COHERE_API_KEY to enable YouTube transcript fact-checking.",
+      },
+      500,
+    );
+  }
+
   const requestId = parsedBody.mode === "queue" ? createJobId() : createRequestId();
   logEvent(requestId, "fact_check_request_received", {
     requestMode: parsedBody.mode,
@@ -359,6 +447,7 @@ app.post("/api/check", async (c) => {
     quality: parsedBody.inputMode === "url" ? parsedBody.quality : null,
     iosCompatible: parsedBody.inputMode === "url" ? parsedBody.iosCompatible : null,
     proxy: parsedBody.inputMode === "url" ? parsedBody.proxy : null,
+    urlMode: parsedBody.inputMode === "url" ? parsedBody.urlMode : null,
     additionalContextLength: parsedBody.additionalContext?.length ?? 0,
     inlineVideoMaxBytes,
     geminiModel: parsedBody.model,
@@ -418,8 +507,16 @@ async function runQueuedFactCheck(requestId: string, input: ParsedFactCheckReque
 }
 
 async function runFactCheck(requestId: string, parsedBody: ParsedFactCheckRequest): Promise<FactCheckResponse> {
+  if (parsedBody.inputMode === "url" && parsedBody.urlMode === "transcript") {
+    return runTranscriptFactCheck(requestId, parsedBody);
+  }
+
+  if (parsedBody.inputMode === "url" && parsedBody.urlMode === "webpage") {
+    return runWebpageFactCheck(requestId, parsedBody);
+  }
+
   const videoInput = parsedBody.inputMode === "url"
-    ? await downloadVideoForInlineUse(requestId, parsedBody)
+    ? await downloadVideoForInlineUse(requestId, { ...parsedBody, downloadMode: "video" })
     : {
         bytes: parsedBody.bytes,
         filename: parsedBody.filename,
@@ -437,8 +534,8 @@ async function runFactCheck(requestId: string, parsedBody: ParsedFactCheckReques
   }
 
   const prompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext);
-  const searchPlan = await createSearchPlan(requestId, videoInput, prompt, parsedBody);
-  const searchResults = await runExaSearches(requestId, searchPlan.searches);
+  const searchPlan = await createSearchPlan(requestId, videoInput, prompt, parsedBody, socialsMaxSearches);
+  const searchResults = await runExaSearches(requestId, searchPlan.searches, socialsResultsPerSearch);
   const searchContext = buildSearchContext(searchResults, searchPlan.searches);
   const finalPrompt = buildFactCheckPrompt(parsedBody.url, parsedBody.additionalContext, searchContext);
 
@@ -450,13 +547,13 @@ async function runFactCheck(requestId: string, parsedBody: ParsedFactCheckReques
     mimeType: videoInput.mimeType,
     sizeBytes: videoInput.sizeBytes,
     filename: videoInput.filename,
-    systemInstructionPreview: truncate(factCheckSystemInstruction, 300),
+    systemInstructionPreview: truncate(buildSystemInstruction("video"), 300),
     promptPreview: truncate(finalPrompt, 500),
     responseMimeType: "text/plain",
     thinkingLevel: parsedBody.thinkingLevel,
     geminiModel: parsedBody.models.finalAnswer,
     exaSearchEnabled: true,
-    exaSearchQueryCount: searchPlan.searches.length,
+    exaSearchQueryActualCount: searchPlan.searches.length,
     exaSearchResultCount: searchResults.length,
     includeThoughts: true,
   });
@@ -481,7 +578,7 @@ async function runFactCheck(requestId: string, parsedBody: ParsedFactCheckReques
         abortSignal: AbortSignal.timeout(geminiTimeoutMs),
         maxOutputTokens: factCheckMaxOutputTokens,
         responseMimeType: "text/plain",
-        systemInstruction: factCheckSystemInstruction,
+        systemInstruction: buildSystemInstruction("video"),
         temperature: 0.2,
         thinkingConfig: {
           includeThoughts: true,
@@ -499,7 +596,7 @@ async function runFactCheck(requestId: string, parsedBody: ParsedFactCheckReques
 
   const candidate = response.candidates?.[0];
   const reasoning = extractThoughtText(candidate?.content?.parts);
-  const warnings = buildWarnings(searchPlan.searches, searchResults);
+  const warnings = buildWarnings(searchPlan.searches, searchResults, socialsMaxSearches, true);
 
   logEvent(requestId, "gemini_response_received", {
     responseId: response.responseId ?? null,
@@ -551,6 +648,8 @@ async function runFactCheck(requestId: string, parsedBody: ParsedFactCheckReques
           sizeBytes: videoInput.sizeBytes,
         }
       : null,
+    transcription: null,
+    webpage: null,
     research: {
       provider: "exa",
       searchType: exaSearchType,
@@ -614,6 +713,65 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function isYoutubeUrl(url: URL | string): boolean {
+  try {
+    const parsed = typeof url === "string" ? new URL(url) : url;
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    return [
+      "youtube.com",
+      "m.youtube.com",
+      "music.youtube.com",
+      "youtu.be",
+      "youtube-nocookie.com",
+    ].includes(host);
+  } catch {
+    return false;
+  }
+}
+
+function isKnownVideoPageUrl(url: URL | string): boolean {
+  try {
+    const parsed = typeof url === "string" ? new URL(url) : url;
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    const path = parsed.pathname.toLowerCase();
+
+    if (/\.(mp4|mov|m4v|webm|m3u8)(?:$|\?)/i.test(path)) {
+      return true;
+    }
+
+    return [
+      "tiktok.com",
+      "vm.tiktok.com",
+      "instagram.com",
+      "x.com",
+      "twitter.com",
+      "facebook.com",
+      "fb.watch",
+      "vimeo.com",
+      "dailymotion.com",
+      "twitch.tv",
+    ].some((videoHost) => host === videoHost || host.endsWith(`.${videoHost}`));
+  } catch {
+    return false;
+  }
+}
+
+function resolveUrlProcessingMode(url: URL, sourceType: UrlSourceType): UrlProcessingMode {
+  if (sourceType === "webpage") {
+    return "webpage";
+  }
+
+  if (sourceType === "video") {
+    return "video";
+  }
+
+  if (isYoutubeUrl(url)) {
+    return "transcript";
+  }
+
+  return isKnownVideoPageUrl(url) ? "video" : "webpage";
+}
+
 async function parseFactCheckRequest(
   request: Request,
 ): Promise<ParsedFactCheckRequest | { error: string; status: 400 | 413 }> {
@@ -650,7 +808,7 @@ async function parseFactCheckRequest(
   }
 
   if (!["http:", "https:"].includes(parsedUrl.protocol)) {
-    return { error: "Only http and https video URLs are supported.", status: 400 };
+    return { error: "Only http and https URLs are supported.", status: 400 };
   }
 
   const quality = typeof body.quality === "string" && body.quality.trim() ? body.quality.trim() : factCheckDownloadQuality;
@@ -698,10 +856,20 @@ async function parseFactCheckRequest(
     return { error: "The mode field must be a string when provided.", status: 400 };
   }
 
+  if (typeof body.sourceType !== "undefined" && typeof body.sourceType !== "string") {
+    return { error: "The sourceType field must be a string when provided.", status: 400 };
+  }
+
   const requestMode = parseRequestMode(typeof body.mode === "string" ? body.mode : undefined);
 
   if ("error" in requestMode) {
     return { error: requestMode.error, status: 400 };
+  }
+
+  const sourceType = parseUrlSourceType(typeof body.sourceType === "string" ? body.sourceType : undefined);
+
+  if ("error" in sourceType) {
+    return { error: sourceType.error, status: 400 };
   }
 
   const rawReasoningEffort = typeof body.reasoningEffort === "string" ? body.reasoningEffort : undefined;
@@ -727,6 +895,8 @@ async function parseFactCheckRequest(
     return { error: geminiSettings.error, status: 400 };
   }
 
+  const urlMode = resolveUrlProcessingMode(parsedUrl, sourceType.sourceType);
+
   return {
     additionalContext: typeof body.additionalContext === "string" && body.additionalContext.trim()
       ? body.additionalContext.trim()
@@ -741,6 +911,8 @@ async function parseFactCheckRequest(
     reasoningEffort: geminiSettings.reasoningEffort,
     thinkingLevel: geminiSettings.thinkingLevel,
     url: parsedUrl.toString(),
+    urlMode,
+    useTranscript: urlMode === "transcript",
   };
 }
 
@@ -982,19 +1154,28 @@ async function downloadVideoForInlineUse(requestId: string, input: UrlFactCheckI
 }
 
 function fetchDownloadVideo(input: UrlFactCheckInput): Promise<Response> {
+  const isAudio = input.downloadMode === "audio";
+
+  const body: Record<string, unknown> = {
+    url: input.url,
+    mode: isAudio ? "audio" : "both",
+    iosCompatible: input.iosCompatible,
+    proxy: input.proxy,
+    playlist: false,
+  };
+
+  if (isAudio) {
+    body.audioQuality = youtubeAudioQuality;
+  } else {
+    body.quality = input.quality;
+  }
+
   return fetch(videoDownloadApiUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({
-      url: input.url,
-      quality: input.quality,
-      mode: "both",
-      iosCompatible: input.iosCompatible,
-      proxy: input.proxy,
-      playlist: false,
-    }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(downloadTimeoutMs),
   });
 }
@@ -1059,9 +1240,10 @@ async function createSearchPlan(
   videoInput: InlineVideoInput,
   prompt: string,
   geminiSettings: GeminiRequestSettings,
+  maxQueries: number,
 ): Promise<SearchPlan> {
   logEvent(requestId, "search_plan_started", {
-    queryCount: exaSearchQueryCount,
+    maxQueries,
     mimeType: videoInput.mimeType,
     sizeBytes: videoInput.sizeBytes,
     model: geminiSettings.models.searchPlan,
@@ -1082,7 +1264,7 @@ async function createSearchPlan(
           },
         },
         {
-          text: buildSearchPlanningPrompt(prompt),
+          text: buildSearchPlanningPrompt("video", maxQueries, { embeddedPrompt: prompt }),
         },
       ],
       config: {
@@ -1103,7 +1285,7 @@ async function createSearchPlan(
     },
   );
 
-  const plan = parseSearchPlan(response.text ?? "");
+  const plan = parseSearchPlan(response.text ?? "", maxQueries);
 
   if (!plan.searches.length) {
     throw new HttpError(502, "Gemini did not produce any Exa search queries.");
@@ -1124,24 +1306,109 @@ async function createSearchPlan(
   return plan;
 }
 
-function buildSearchPlanningPrompt(prompt: string): string {
-  return [
-    prompt,
-    "",
-    "Create search queries for Exa that will verify the most important factual claims in the video.",
-    `Return exactly ${exaSearchQueryCount} different individual search quer${exaSearchQueryCount === 1 ? "y" : "ies"}.`,
-    "Choose queries that cover different angles of the claims so the final fact-check has a wide scope.",
+function buildSearchPlanningPrompt(
+  mode: FactCheckMode,
+  maxQueries: number,
+  options: {
+    url?: string | null;
+    additionalContext?: string | null;
+    embeddedPrompt?: string;
+    transcript?: string;
+    webpage?: SearchResultContext & { truncated: boolean };
+  },
+): string {
+  const sections: string[] = [];
+
+  if (options.embeddedPrompt) {
+    sections.push(options.embeddedPrompt, "");
+  }
+
+  if (mode === "transcript") {
+    sections.push(
+      "You are creating Exa web search queries to fact-check a YouTube video.",
+      "You only have the transcript of the video; you do not see or hear the video itself.",
+    );
+  } else if (mode === "webpage") {
+    sections.push("You are creating Exa web search queries to fact-check an article or webpage.");
+  } else {
+    sections.push("Create search queries for Exa that will verify the most important factual claims in the video.");
+  }
+
+  const sourceName = mode === "transcript" ? "transcript" : mode === "webpage" ? "article" : "video";
+  const genericTerms =
+    mode === "transcript"
+      ? "fact check, viral video, or YouTube short"
+      : mode === "webpage"
+        ? "fact check or viral article"
+        : "fact check, viral video, or TikTok";
+
+  sections.push(
+    `Read the ${sourceName} carefully and identify the material factual claims that need outside verification, including names, dates, places, statistics, scientific or medical claims, political or historical claims, alleged quotes, events, organizations, and other distinctive factual details.`,
+  );
+
+  if (mode === "transcript") {
+    sections.push(
+      `YouTube videos can be long and contain many independent claims. Generate as many search queries as you need to cover the important claims, but never more than ${maxQueries} queries in total.`,
+    );
+  } else {
+    sections.push(
+      `Return up to ${maxQueries} different individual search quer${maxQueries === 1 ? "y" : "ies"}.`,
+    );
+  }
+
+  sections.push(
+    "Choose queries that cover different important claims or evidence angles so the final fact-check has useful breadth.",
+    "If the source contains multiple distinct claims, distribute the searches across as many important claims as possible instead of over-focusing on only one claim or angle.",
+    "Do not pad with filler searches when the source has only a few material claims; only add queries that can verify a distinct claim or useful context.",
     "Avoid near-duplicate queries when possible; if the topic is very specific and overlap is unavoidable, prioritize useful coverage over artificial variety.",
-    "If the video contains fewer obvious factual claims than the requested query count, create broader corroborating searches for context, source material, dates, locations, people, organizations, and quoted claims.",
-    "Prefer precise queries with names, places, dates, quoted phrases, organizations, laws, events, statistics, and other distinctive terms visible or spoken in the video.",
-    "Do not search for generic terms like fact check, viral video, or TikTok unless they are part of the claim.",
+    "Prefer precise queries with names, places, dates, quoted phrases, organizations, laws, events, statistics, and other distinctive terms from the source.",
+    `Do not search for generic terms like ${genericTerms} unless they are part of the claim.`,
+  );
+
+  if (mode === "transcript") {
+    sections.push(
+      "Treat the transcript as automatically generated, so it may contain mishearings or proper-noun errors; if a name or term in the transcript looks garbled, search for the most plausible spelling rather than copying the obvious error.",
+    );
+  }
+
+  sections.push(
     "",
     "Return exactly this JSON shape:",
     '{"searches":[{"query":"specific search query","rationale":"brief reason this search is needed"}]}',
-  ].join("\n");
+  );
+
+  if (mode === "webpage" && options.webpage) {
+    sections.push(
+      "",
+      "Article metadata:",
+      `Title: ${options.webpage.title ?? "Untitled"}`,
+      `URL: ${options.webpage.url}`,
+      `Published date: ${options.webpage.publishedDate ?? "Unknown"}`,
+      `Author: ${options.webpage.author ?? "Unknown"}`,
+      `Text truncated: ${options.webpage.truncated ? "yes" : "no"}`,
+    );
+  }
+
+  if (options.url && mode !== "webpage") {
+    sections.push("", `Source video URL: ${options.url}`);
+  }
+
+  if (options.additionalContext) {
+    sections.push("", `Additional context from the API caller: ${options.additionalContext}`);
+  }
+
+  if (mode === "transcript" && options.transcript) {
+    sections.push("", "Transcript of the YouTube video:", options.transcript);
+  }
+
+  if (mode === "webpage" && options.webpage) {
+    sections.push("", "Article text:", options.webpage.text);
+  }
+
+  return sections.join("\n");
 }
 
-function parseSearchPlan(rawText: string): SearchPlan {
+function parseSearchPlan(rawText: string, maxQueries: number): SearchPlan {
   const parsed = parseJsonObject(rawText);
   const rawSearches = Array.isArray(parsed?.searches) ? parsed.searches : [];
   const searches: SearchQuery[] = [];
@@ -1165,7 +1432,7 @@ function parseSearchPlan(rawText: string): SearchPlan {
       rationale: typeof value.rationale === "string" && value.rationale.trim() ? value.rationale.trim() : null,
     });
 
-    if (searches.length >= exaSearchQueryCount) {
+    if (searches.length >= maxQueries) {
       break;
     }
   }
@@ -1201,6 +1468,16 @@ function parseRequestMode(rawMode: string | undefined): { mode: RequestMode } | 
   }
 
   return { mode };
+}
+
+function parseUrlSourceType(rawSourceType: string | undefined): { sourceType: UrlSourceType } | { error: string } {
+  const sourceType = rawSourceType?.trim().toLowerCase() || "auto";
+
+  if (sourceType !== "auto" && sourceType !== "video" && sourceType !== "webpage") {
+    return { error: "The sourceType field must be one of: auto, video, webpage." };
+  }
+
+  return { sourceType: sourceType as UrlSourceType };
 }
 
 function parseMultipartModelEntry(modelEntry: FormDataEntryValue | null): string | string[] | undefined {
@@ -1279,7 +1556,11 @@ function normalizeRequestedModel(
   }
 
   if (typeof rawModel === "string") {
-    const model = rawModel.trim() || defaultGeminiSettings.model;
+    const model = rawModel.trim();
+
+    if (!model) {
+      return defaultGeminiSettings.model;
+    }
 
     if (!isSupportedGeminiModel(model)) {
       throw new Error(`The model field must be one of: ${supportedGeminiModels.join(", ")}.`);
@@ -1329,15 +1610,855 @@ function isReasoningEffort(value: string): value is ReasoningEffort {
   return supportedReasoningEfforts.includes(value as ReasoningEffort);
 }
 
-async function runExaSearches(requestId: string, searches: SearchQuery[]): Promise<SearchResultContext[]> {
-  logEvent(requestId, "exa_search_started", {
-    searchType: exaSearchType,
-    queryCount: searches.length,
-    resultsPerQuery: exaResultsPerQuery,
+async function runTranscriptFactCheck(
+  requestId: string,
+  parsedBody: Extract<ParsedFactCheckRequest, { inputMode: "url" }>,
+): Promise<FactCheckResponse> {
+  const audioInput = await downloadAudioForTranscription(requestId, {
+    downloadMode: "audio",
+    iosCompatible: parsedBody.iosCompatible,
+    proxy: parsedBody.proxy,
+    quality: parsedBody.quality,
+    url: parsedBody.url,
+  });
+
+  const transcript = await transcribeAudioWithCohere(requestId, audioInput);
+
+  const searchPlan = await createTranscriptSearchPlan(
+    requestId,
+    transcript,
+    parsedBody.url,
+    parsedBody.additionalContext,
+    parsedBody,
+    youtubeMaxSearches,
+  );
+
+  const searchResults = await runExaSearches(requestId, searchPlan.searches, youtubeResultsPerSearch);
+  const searchContext = buildSearchContext(searchResults, searchPlan.searches);
+  const finalPrompt = buildTranscriptFactCheckPrompt(
+    parsedBody.url,
+    parsedBody.additionalContext,
+    transcript,
+    searchContext,
+  );
+
+  await delayBeforeGeminiStep(requestId, "final_answer");
+
+  logEvent(requestId, "gemini_request_prepared", {
+    inputMode: "url",
+    sourceUrl: parsedBody.url,
+    transcriptCharacters: transcript.length,
+    audioMimeType: audioInput.mimeType,
+    audioSizeBytes: audioInput.sizeBytes,
+    audioFilename: audioInput.filename,
+    systemInstructionPreview: truncate(buildSystemInstruction("transcript"), 300),
+    promptPreview: truncate(finalPrompt, 500),
+    responseMimeType: "text/plain",
+    thinkingLevel: parsedBody.thinkingLevel,
+    geminiModel: parsedBody.models.finalAnswer,
+    exaSearchEnabled: true,
+    exaSearchQueryActualCount: searchPlan.searches.length,
+    exaSearchResultCount: searchResults.length,
+    includeThoughts: true,
+    transcriptMode: true,
+  });
+
+  const response = await generateGeminiContentWithRetry(
+    requestId,
+    "final_answer",
+    {
+      model: parsedBody.models.finalAnswer,
+      contents: [
+        {
+          text: finalPrompt,
+        },
+      ],
+      config: {
+        abortSignal: AbortSignal.timeout(geminiTimeoutMs),
+        maxOutputTokens: factCheckMaxOutputTokens,
+        responseMimeType: "text/plain",
+        systemInstruction: buildSystemInstruction("transcript"),
+        temperature: 0.2,
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: parsedBody.thinkingLevel,
+        },
+      },
+    },
+  );
+
+  const analysis = response.text?.trim() || "";
+
+  if (!analysis) {
+    throw new HttpError(502, "Gemini returned an empty response.");
+  }
+
+  const candidate = response.candidates?.[0];
+  const reasoning = extractThoughtText(candidate?.content?.parts);
+  const warnings = buildWarnings(searchPlan.searches, searchResults, youtubeMaxSearches, true);
+
+  logEvent(requestId, "gemini_response_received", {
+    responseId: response.responseId ?? null,
+    modelVersion: response.modelVersion ?? null,
+    finishReason: candidate?.finishReason ?? null,
+    finishMessage: candidate?.finishMessage ?? null,
+    promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
+    candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
+    thoughtsTokenCount: response.usageMetadata?.thoughtsTokenCount ?? null,
+    toolUsePromptTokenCount: response.usageMetadata?.toolUsePromptTokenCount ?? null,
+    totalTokenCount: response.usageMetadata?.totalTokenCount ?? null,
+    exaSearchQueries: searchPlan.searches,
+    exaSources: searchResults.map((result) => ({
+      query: result.query,
+      title: result.title,
+      uri: result.url,
+      publishedDate: result.publishedDate,
+    })),
+    reasoningPreview: reasoning ? truncate(reasoning, 3000) : null,
+    analysisPreview: truncate(analysis, 5000),
+    warnings,
+    transcriptMode: true,
+  });
+
+  return {
+    id: requestId,
+    inputMode: "url",
+    url: parsedBody.url,
+    model: parsedBody.model,
+    models: parsedBody.models,
+    reasoningEffort: parsedBody.reasoningEffort,
+    analysis,
+    reasoning,
+    download: null,
+    uploadedFile: null,
+    transcription: {
+      provider: "cohere",
+      model: cohereTranscribeModel,
+      language: cohereTranscribeLanguage,
+      characterCount: transcript.length,
+      audio: {
+        apiUrl: videoDownloadApiUrl,
+        filename: audioInput.filename,
+        mimeType: audioInput.mimeType,
+        sizeBytes: audioInput.sizeBytes,
+        iosCompatible: parsedBody.iosCompatible,
+        proxy: parsedBody.proxy,
+      },
+    },
+    webpage: null,
+    research: {
+      provider: "exa",
+      searchType: exaSearchType,
+      queries: searchPlan.searches,
+      results: searchResults.map((result) => ({
+        query: result.query,
+        title: result.title,
+        url: result.url,
+        publishedDate: result.publishedDate,
+        author: result.author,
+      })),
+    },
+    usage: response.usageMetadata
+      ? {
+          promptTokenCount: response.usageMetadata.promptTokenCount ?? null,
+          candidatesTokenCount: response.usageMetadata.candidatesTokenCount ?? null,
+          thoughtsTokenCount: response.usageMetadata.thoughtsTokenCount ?? null,
+          toolUsePromptTokenCount: response.usageMetadata.toolUsePromptTokenCount ?? null,
+          totalTokenCount: response.usageMetadata.totalTokenCount ?? null,
+        }
+      : null,
+    warnings,
+  };
+}
+
+async function downloadAudioForTranscription(
+  requestId: string,
+  input: UrlFactCheckInput,
+): Promise<{
+  bytes: Uint8Array;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+}> {
+  logEvent(requestId, "audio_download_started", {
+    sourceUrl: input.url,
+    downloaderUrl: videoDownloadApiUrl,
+    audioQuality: youtubeAudioQuality,
+    proxy: input.proxy,
+    iosCompatible: input.iosCompatible,
+  });
+
+  const response = await fetchDownloadVideo({ ...input, downloadMode: "audio" });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new HttpError(
+      502,
+      `Audio download API failed with status ${response.status}.${errorText ? ` ${truncate(errorText, 500)}` : ""}`,
+    );
+  }
+
+  const contentLengthHeader = response.headers.get("content-length");
+  const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : Number.NaN;
+
+  if (!Number.isNaN(contentLength) && contentLength > youtubeAudioMaxBytes) {
+    throw new HttpError(
+      413,
+      `Downloaded audio is ${contentLength} bytes, which exceeds YOUTUBE_AUDIO_MAX_BYTES (${youtubeAudioMaxBytes}).`,
+    );
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+
+  if (bytes.byteLength > youtubeAudioMaxBytes) {
+    throw new HttpError(
+      413,
+      `Downloaded audio is ${bytes.byteLength} bytes, which exceeds YOUTUBE_AUDIO_MAX_BYTES (${youtubeAudioMaxBytes}).`,
+    );
+  }
+
+  const mimeType = normalizeAudioMimeType(response.headers.get("content-type"));
+  const filename = getFilenameFromHeaders(response.headers) || `${createRequestId()}.mp3`;
+
+  logEvent(requestId, "audio_download_completed", {
+    sourceUrl: input.url,
+    downloaderUrl: videoDownloadApiUrl,
+    status: response.status,
+    filename,
+    mimeType,
+    sizeBytes: bytes.byteLength,
+    contentLengthHeader: contentLengthHeader ?? null,
+  });
+
+  return {
+    bytes,
+    filename,
+    mimeType,
+    sizeBytes: bytes.byteLength,
+  };
+}
+
+async function transcribeAudioWithCohere(
+  requestId: string,
+  audio: { bytes: Uint8Array; filename: string; mimeType: string; sizeBytes: number },
+): Promise<string> {
+  logEvent(requestId, "cohere_transcribe_started", {
+    model: cohereTranscribeModel,
+    language: cohereTranscribeLanguage,
+    audioFilename: audio.filename,
+    audioMimeType: audio.mimeType,
+    audioSizeBytes: audio.sizeBytes,
+  });
+
+  const formData = new FormData();
+  formData.append("model", cohereTranscribeModel);
+  formData.append("language", cohereTranscribeLanguage);
+  formData.append(
+    "file",
+    new Blob([Buffer.from(audio.bytes)], { type: audio.mimeType }),
+    audio.filename,
+  );
+
+  const response = await fetch("https://api.cohere.com/v2/audio/transcriptions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cohereApiKey}`,
+    },
+    body: formData,
+    signal: AbortSignal.timeout(cohereTranscribeTimeoutMs),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new HttpError(
+      response.status === 429 ? 429 : 502,
+      `Cohere transcription failed with status ${response.status}.${errorText ? ` ${truncate(errorText, 500)}` : ""}`,
+    );
+  }
+
+  let body: unknown;
+
+  try {
+    body = await response.json();
+  } catch {
+    throw new HttpError(502, "Cohere returned a response that was not valid JSON.");
+  }
+
+  const transcript = isRecord(body) && typeof body.text === "string" ? body.text.trim() : "";
+
+  if (!transcript) {
+    throw new HttpError(502, "Cohere returned an empty transcript.");
+  }
+
+  logEvent(requestId, "cohere_transcribe_completed", {
+    model: cohereTranscribeModel,
+    language: cohereTranscribeLanguage,
+    transcriptCharacters: transcript.length,
+    transcriptPreview: truncate(transcript, 500),
+  });
+
+  return transcript;
+}
+
+async function createTranscriptSearchPlan(
+  requestId: string,
+  transcript: string,
+  url: string | null,
+  additionalContext: string | null,
+  geminiSettings: GeminiRequestSettings,
+  maxQueries: number,
+): Promise<SearchPlan> {
+  logEvent(requestId, "search_plan_started", {
+    transcriptCharacters: transcript.length,
+    maxQueries,
+    model: geminiSettings.models.searchPlan,
+    reasoningEffort: geminiSettings.reasoningEffort,
+    thinkingLevel: geminiSettings.thinkingLevel,
+    transcriptMode: true,
+  });
+
+  const response = await generateGeminiContentWithRetry(
+    requestId,
+    "search_plan",
+    {
+      model: geminiSettings.models.searchPlan,
+      contents: [
+        {
+          text: buildSearchPlanningPrompt("transcript", maxQueries, { url, additionalContext, transcript }),
+        },
+      ],
+      config: {
+        abortSignal: AbortSignal.timeout(geminiTimeoutMs),
+        maxOutputTokens: searchPlanMaxOutputTokens,
+        responseMimeType: "application/json",
+        systemInstruction: [
+          "You are a fact-checking research planner.",
+          "Read the supplied YouTube video transcript and identify the claims that need outside verification.",
+          "Return only valid JSON matching the requested schema.",
+        ].join(" "),
+        temperature: 0.2,
+        thinkingConfig: {
+          includeThoughts: false,
+          thinkingLevel: geminiSettings.thinkingLevel,
+        },
+      },
+    },
+  );
+
+  const plan = parseSearchPlan(response.text ?? "", maxQueries);
+
+  if (!plan.searches.length) {
+    throw new HttpError(502, "Gemini did not produce any Exa search queries.");
+  }
+
+  logEvent(requestId, "search_plan_completed", {
+    responseId: response.responseId ?? null,
+    modelVersion: response.modelVersion ?? null,
+    finishReason: response.candidates?.[0]?.finishReason ?? null,
+    finishMessage: response.candidates?.[0]?.finishMessage ?? null,
+    promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
+    candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
+    thoughtsTokenCount: response.usageMetadata?.thoughtsTokenCount ?? null,
+    totalTokenCount: response.usageMetadata?.totalTokenCount ?? null,
+    searches: plan.searches,
+    transcriptMode: true,
+  });
+
+  return plan;
+}
+
+function buildTranscriptSearchPlanningPrompt(
+  url: string | null,
+  additionalContext: string | null,
+  transcript: string,
+  maxQueries: number,
+): string {
+  const sections: string[] = [];
+
+  sections.push(
+    "You are creating Exa web search queries to fact-check a YouTube video.",
+    "You only have the transcript of the video; you do not see or hear the video itself.",
+    "Read the transcript carefully and identify the material factual claims that need outside verification, including names, dates, places, statistics, scientific or medical claims, political or historical claims, alleged quotes, events, organizations, and any other distinctive factual details.",
+    `YouTube videos can be long and contain many independent claims. Generate as many search queries as you need to cover the important claims, but never more than ${maxQueries} queries in total.`,
+    "If the transcript contains multiple distinct claims, distribute the searches across as many important claims as possible instead of spending most searches on only one claim or angle.",
+    "Do not pad with filler queries when the transcript has only a few claims; only add queries that genuinely help verify a distinct claim.",
+    "Avoid near-duplicate queries when possible; if the topic is very specific and overlap is unavoidable, prioritize useful coverage over artificial variety.",
+    "Prefer precise queries with names, places, dates, quoted phrases, organizations, laws, events, statistics, and other distinctive terms from the transcript.",
+    "Do not search for generic terms like fact check, viral video, or YouTube short unless they are part of the claim.",
+    "Treat the transcript as automatically generated, so it may contain mishearings or proper-noun errors; if a name or term in the transcript looks garbled, search for the most plausible spelling rather than copying the obvious error.",
+    "",
+    "Return only valid JSON in exactly this shape:",
+    '{"searches":[{"query":"specific search query","rationale":"brief reason this search is needed"}]}',
+  );
+
+  if (url) {
+    sections.push("", `Source video URL: ${url}`);
+  }
+
+  if (additionalContext) {
+    sections.push("", `Additional context from the API caller: ${additionalContext}`);
+  }
+
+  sections.push("", "Transcript of the YouTube video:", transcript);
+
+  return sections.join("\n");
+}
+
+function buildTranscriptFactCheckPrompt(
+  url: string | null,
+  additionalContext: string | null,
+  transcript: string,
+  searchContext: string,
+): string {
+  const sections: string[] = [];
+
+  if (url) {
+    sections.push(`Source video URL: ${url}`, "");
+  }
+
+  sections.push(
+    "Fact-check the following YouTube video using its automatically generated transcript and the provided Exa search evidence.",
+    "Identify the material factual claims made in the transcript and check them against the Exa results.",
+    "Note that automatic transcripts may contain mishearings or proper-noun errors; if a claim hinges on a specific name or word that looks garbled in the transcript, say so rather than inventing a corrected version.",
+    "Use the search evidence to verify dates, places, names, health claims, politics, science, history, crime, war, statistics, alleged quotes, and other factual details.",
+    "When a conclusion is supported by Exa results, cite in the main text with bracket numbers only: one source is [1]; several sources are written as adjacent brackets, e.g. [1][2][4][9], never [1, 2, 4, 9]. Each number refers to the same-numbered line in the Sources list at the end. Do not paste long URLs in the main paragraphs.",
+    "If the search evidence does not cover a claim, say it is unverifiable from the available evidence.",
+    "For origin stories, distinguish claims that are historically supported from claims that are merely widely repeated but uncertain.",
+    "",
+    "Output format requirements (very important): the entire response must be plain text with no markdown. No # headings, no asterisks for bold or italics, no backticks, no link syntax like square brackets for URLs, no blockquotes, no code fences, no tables.",
+    "Start with a line exactly in this format: Confidence: X/10 where X is a whole number from 1 to 10.",
+    "Calibrate the confidence score realistically. Do not be overly generous or overly harsh. Use moderate scores for mixed or incomplete evidence, and reserve extreme scores for unusually strong or unusually weak evidence.",
+    "After that, add a blank line and then a line exactly: Explanation:",
+    "Under Explanation:, write one short overall verdict sentence first.",
+    "Then write one short summary paragraph.",
+    "Then cover each significant claim in plain text as continuous paragraphs, one after another, using [1] or [1][2] style references (adjacent brackets only) where evidence applies.",
+    "For each claim, say whether it is true, false, misleading, missing context, or unverifiable, and explain why.",
+    "Call out omitted context, outdated context, manipulated framing, and other tells of misinformation when present.",
+    "After the explanation paragraphs, on its own, add a blank line, then a line with exactly: Sources:",
+    "Then one line per cited source in order, each line exactly: [n] - https://full.url/path (for example: [1] - https://example.com/page )",
+    "After the source lines, add a blank line, then a line with exactly: Searches:",
+    "Then list every Exa search query from the Exa searches performed section, one per line in order, exactly in this format: (1) - query text, (2) - query text, and so on, with no bullets or extra text.",
+  );
+
+  if (additionalContext) {
+    sections.push("", `Additional context from the API caller: ${additionalContext}`);
+  }
+
+  sections.push("", "Transcript of the YouTube video:", transcript);
+  sections.push("", searchContext);
+
+  return sections.join("\n");
+}
+
+async function runWebpageFactCheck(
+  requestId: string,
+  parsedBody: Extract<ParsedFactCheckRequest, { inputMode: "url" }>,
+): Promise<FactCheckResponse> {
+  const webpage = await getExaWebpageContent(requestId, parsedBody.url);
+  const searchPlan = await createWebpageSearchPlan(
+    requestId,
+    webpage,
+    parsedBody.additionalContext,
+    parsedBody,
+    articleMaxSearches,
+  );
+  const searchResults = await runExaSearches(
+    requestId,
+    searchPlan.searches,
+    articleResultsPerSearch,
+    [parsedBody.url, webpage.url],
+  );
+  const searchContext = buildSearchContext(searchResults, searchPlan.searches);
+  const finalPrompt = buildWebpageFactCheckPrompt(webpage, parsedBody.additionalContext, searchContext);
+
+  await delayBeforeGeminiStep(requestId, "final_answer");
+
+  logEvent(requestId, "gemini_request_prepared", {
+    inputMode: "url",
+    urlMode: "webpage",
+    sourceUrl: parsedBody.url,
+    webpageUrl: webpage.url,
+    webpageTitle: webpage.title,
+    webpageCharacters: webpage.text.length,
+    webpageTruncated: webpage.truncated,
+    systemInstructionPreview: truncate(buildSystemInstruction("webpage"), 300),
+    promptPreview: truncate(finalPrompt, 500),
+    responseMimeType: "text/plain",
+    thinkingLevel: parsedBody.thinkingLevel,
+    geminiModel: parsedBody.models.finalAnswer,
+    exaSearchEnabled: true,
+    exaSearchQueryActualCount: searchPlan.searches.length,
+    exaSearchResultCount: searchResults.length,
+    includeThoughts: true,
+  });
+
+  const response = await generateGeminiContentWithRetry(
+    requestId,
+    "final_answer",
+    {
+      model: parsedBody.models.finalAnswer,
+      contents: [
+        {
+          text: finalPrompt,
+        },
+      ],
+      config: {
+        abortSignal: AbortSignal.timeout(geminiTimeoutMs),
+        maxOutputTokens: factCheckMaxOutputTokens,
+        responseMimeType: "text/plain",
+        systemInstruction: buildSystemInstruction("webpage"),
+        temperature: 0.2,
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: parsedBody.thinkingLevel,
+        },
+      },
+    },
+  );
+
+  const analysis = response.text?.trim() || "";
+
+  if (!analysis) {
+    throw new HttpError(502, "Gemini returned an empty response.");
+  }
+
+  const candidate = response.candidates?.[0];
+  const reasoning = extractThoughtText(candidate?.content?.parts);
+  const warnings = buildWarnings(searchPlan.searches, searchResults, articleMaxSearches, true);
+
+  if (webpage.truncated) {
+    warnings.push(`Exa returned more article text than EXA_SEARCH_TEXT_MAX_CHARACTERS (${exaTextMaxCharacters}); the article was truncated before Gemini analysis.`);
+  }
+
+  logEvent(requestId, "gemini_response_received", {
+    responseId: response.responseId ?? null,
+    modelVersion: response.modelVersion ?? null,
+    finishReason: candidate?.finishReason ?? null,
+    finishMessage: candidate?.finishMessage ?? null,
+    promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
+    candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
+    thoughtsTokenCount: response.usageMetadata?.thoughtsTokenCount ?? null,
+    toolUsePromptTokenCount: response.usageMetadata?.toolUsePromptTokenCount ?? null,
+    totalTokenCount: response.usageMetadata?.totalTokenCount ?? null,
+    exaSearchQueries: searchPlan.searches,
+    exaSources: searchResults.map((result) => ({
+      query: result.query,
+      title: result.title,
+      uri: result.url,
+      publishedDate: result.publishedDate,
+    })),
+    reasoningPreview: reasoning ? truncate(reasoning, 3000) : null,
+    analysisPreview: truncate(analysis, 5000),
+    warnings,
+    webpageMode: true,
+  });
+
+  return {
+    id: requestId,
+    inputMode: "url",
+    url: parsedBody.url,
+    model: parsedBody.model,
+    models: parsedBody.models,
+    reasoningEffort: parsedBody.reasoningEffort,
+    analysis,
+    reasoning,
+    download: null,
+    uploadedFile: null,
+    transcription: null,
+    webpage: {
+      provider: "exa",
+      title: webpage.title,
+      url: webpage.url,
+      publishedDate: webpage.publishedDate,
+      author: webpage.author,
+      characterCount: webpage.text.length,
+      truncated: webpage.truncated,
+    },
+    research: {
+      provider: "exa",
+      searchType: exaSearchType,
+      queries: searchPlan.searches,
+      results: searchResults.map((result) => ({
+        query: result.query,
+        title: result.title,
+        url: result.url,
+        publishedDate: result.publishedDate,
+        author: result.author,
+      })),
+    },
+    usage: response.usageMetadata
+      ? {
+          promptTokenCount: response.usageMetadata.promptTokenCount ?? null,
+          candidatesTokenCount: response.usageMetadata.candidatesTokenCount ?? null,
+          thoughtsTokenCount: response.usageMetadata.thoughtsTokenCount ?? null,
+          toolUsePromptTokenCount: response.usageMetadata.toolUsePromptTokenCount ?? null,
+          totalTokenCount: response.usageMetadata.totalTokenCount ?? null,
+        }
+      : null,
+    warnings,
+  };
+}
+
+async function getExaWebpageContent(
+  requestId: string,
+  url: string,
+): Promise<SearchResultContext & { truncated: boolean }> {
+  logEvent(requestId, "exa_contents_started", {
+    url,
     textMaxCharacters: exaTextMaxCharacters,
   });
 
-  const responses = await Promise.all(searches.map((search) => runExaSearch(search.query)));
+  const response = await fetch("https://api.exa.ai/contents", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": exaApiKey,
+    },
+    body: JSON.stringify({
+      urls: [url],
+      text: true,
+    }),
+    signal: AbortSignal.timeout(exaTimeoutMs),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new HttpError(
+      response.status === 429 ? 429 : 502,
+      `Exa contents failed with status ${response.status}.${errorText ? ` ${truncate(errorText, 500)}` : ""}`,
+    );
+  }
+
+  const body: unknown = await response.json();
+  const contents = isRecord(body) ? body as ExaContentsResponse : {};
+  const result = contents.results?.[0];
+  const text = typeof result?.text === "string" ? result.text.trim() : "";
+
+  if (!result || !text) {
+    const status = contents.statuses?.[0];
+    const statusDetail = status?.error
+      ? ` ${status.error.tag ?? "unknown"}${status.error.httpStatusCode ? ` (${status.error.httpStatusCode})` : ""}`
+      : "";
+
+    throw new HttpError(502, `Exa could not retrieve readable webpage text.${statusDetail}`);
+  }
+
+  const limitedText = limitText(text, exaTextMaxCharacters);
+  const webpage = {
+    author: typeof result.author === "string" && result.author.trim() ? result.author.trim() : null,
+    publishedDate: typeof result.publishedDate === "string" && result.publishedDate.trim()
+      ? result.publishedDate.trim()
+      : null,
+    query: "source webpage",
+    text: limitedText.text,
+    title: typeof result.title === "string" && result.title.trim() ? result.title.trim() : null,
+    url: typeof result.url === "string" && result.url.trim() ? result.url.trim() : url,
+    truncated: limitedText.truncated,
+  };
+
+  logEvent(requestId, "exa_contents_completed", {
+    requestId: contents.requestId ?? null,
+    requestedUrl: url,
+    resolvedUrl: webpage.url,
+    title: webpage.title,
+    publishedDate: webpage.publishedDate,
+    author: webpage.author,
+    textCharacters: webpage.text.length,
+    originalTextCharacters: text.length,
+    truncated: webpage.truncated,
+    statuses: contents.statuses ?? null,
+  });
+
+  return webpage;
+}
+
+async function createWebpageSearchPlan(
+  requestId: string,
+  webpage: SearchResultContext & { truncated: boolean },
+  additionalContext: string | null,
+  geminiSettings: GeminiRequestSettings,
+  maxQueries: number,
+): Promise<SearchPlan> {
+  logEvent(requestId, "search_plan_started", {
+    maxQueries,
+    webpageUrl: webpage.url,
+    webpageTitle: webpage.title,
+    webpageCharacters: webpage.text.length,
+    model: geminiSettings.models.searchPlan,
+    reasoningEffort: geminiSettings.reasoningEffort,
+    thinkingLevel: geminiSettings.thinkingLevel,
+    webpageMode: true,
+  });
+
+  const response = await generateGeminiContentWithRetry(
+    requestId,
+    "search_plan",
+    {
+      model: geminiSettings.models.searchPlan,
+      contents: [
+        {
+          text: buildSearchPlanningPrompt("webpage", maxQueries, { additionalContext, webpage }),
+        },
+      ],
+      config: {
+        abortSignal: AbortSignal.timeout(geminiTimeoutMs),
+        maxOutputTokens: searchPlanMaxOutputTokens,
+        responseMimeType: "application/json",
+        systemInstruction: [
+          "You are a fact-checking research planner.",
+          "Read the supplied article or webpage and identify the claims that need outside verification.",
+          "Return only valid JSON matching the requested schema.",
+        ].join(" "),
+        temperature: 0.2,
+        thinkingConfig: {
+          includeThoughts: false,
+          thinkingLevel: geminiSettings.thinkingLevel,
+        },
+      },
+    },
+  );
+
+  const plan = parseSearchPlan(response.text ?? "", maxQueries);
+
+  if (!plan.searches.length) {
+    throw new HttpError(502, "Gemini did not produce any Exa search queries.");
+  }
+
+  logEvent(requestId, "search_plan_completed", {
+    responseId: response.responseId ?? null,
+    modelVersion: response.modelVersion ?? null,
+    finishReason: response.candidates?.[0]?.finishReason ?? null,
+    finishMessage: response.candidates?.[0]?.finishMessage ?? null,
+    promptTokenCount: response.usageMetadata?.promptTokenCount ?? null,
+    candidatesTokenCount: response.usageMetadata?.candidatesTokenCount ?? null,
+    thoughtsTokenCount: response.usageMetadata?.thoughtsTokenCount ?? null,
+    totalTokenCount: response.usageMetadata?.totalTokenCount ?? null,
+    searches: plan.searches,
+    webpageMode: true,
+  });
+
+  return plan;
+}
+
+function buildWebpageSearchPlanningPrompt(
+  webpage: SearchResultContext & { truncated: boolean },
+  additionalContext: string | null,
+  maxQueries: number,
+): string {
+  const sections: string[] = [
+    "You are creating Exa web search queries to fact-check an article or webpage.",
+    "Read the article carefully and identify the material factual claims that need outside verification, including names, dates, places, statistics, scientific or medical claims, political or historical claims, alleged quotes, events, organizations, and other distinctive factual details.",
+    `Return up to ${maxQueries} different individual search quer${maxQueries === 1 ? "y" : "ies"}.`,
+    "Choose queries that verify the article's claims using independent sources, not the article itself.",
+    "Avoid near-duplicate queries when possible; if the topic is very specific and overlap is unavoidable, prioritize useful coverage over artificial variety.",
+    "If the article contains multiple distinct claims, distribute the searches across as many important claims as possible rather than over-focusing on only one claim or angle.",
+    "Do not pad with filler searches when the article has only a few material claims; only add queries that can verify a distinct claim or useful context.",
+    "Prefer precise queries with names, places, dates, quoted phrases, organizations, laws, events, statistics, and other distinctive terms from the article.",
+    "Do not search for generic terms like fact check or viral article unless they are part of the claim.",
+    "",
+    "Return exactly this JSON shape:",
+    '{"searches":[{"query":"specific search query","rationale":"brief reason this search is needed"}]}',
+    "",
+    "Article metadata:",
+    `Title: ${webpage.title ?? "Untitled"}`,
+    `URL: ${webpage.url}`,
+    `Published date: ${webpage.publishedDate ?? "Unknown"}`,
+    `Author: ${webpage.author ?? "Unknown"}`,
+    `Text truncated: ${webpage.truncated ? "yes" : "no"}`,
+  ];
+
+  if (additionalContext) {
+    sections.push("", `Additional context from the API caller: ${additionalContext}`);
+  }
+
+  sections.push("", "Article text:", webpage.text);
+
+  return sections.join("\n");
+}
+
+function buildWebpageFactCheckPrompt(
+  webpage: SearchResultContext & { truncated: boolean },
+  additionalContext: string | null,
+  searchContext: string,
+): string {
+  const sections: string[] = [
+    "Fact-check the following article or webpage using the provided Exa search evidence.",
+    "Identify the material factual claims made in the article and check them against independent search results.",
+    "Do not treat the article itself as evidence that its own claims are true.",
+    "Use the search evidence to verify dates, places, names, health claims, politics, science, history, crime, war, statistics, alleged quotes, and other factual details.",
+    "When a conclusion is supported by Exa results, cite in the main text with bracket numbers only: one source is [1]; several sources are written as adjacent brackets, e.g. [1][2][4][9], never [1, 2, 4, 9]. Each number refers to the same-numbered line in the Sources list at the end. Do not paste long URLs in the main paragraphs.",
+    "If the search evidence does not cover a claim, say it is unverifiable from the available evidence.",
+    "For origin stories, distinguish claims that are historically supported from claims that are merely widely repeated but uncertain.",
+    "",
+    "Output format requirements (very important): the entire response must be plain text with no markdown. No # headings, no asterisks for bold or italics, no backticks, no link syntax like square brackets for URLs, no blockquotes, no code fences, no tables.",
+    "Start with a line exactly in this format: Confidence: X/10 where X is a whole number from 1 to 10.",
+    "Calibrate the confidence score realistically. Do not be overly generous or overly harsh. Use moderate scores for mixed or incomplete evidence, and reserve extreme scores for unusually strong or unusually weak evidence.",
+    "After that, add a blank line and then a line exactly: Explanation:",
+    "Under Explanation:, write one short overall verdict sentence first.",
+    "Then write one short summary paragraph.",
+    "Then cover each significant claim in plain text as continuous paragraphs, one after another, using [1] or [1][2] style references (adjacent brackets only) where evidence applies.",
+    "For each claim, say whether it is true, false, misleading, missing context, or unverifiable, and explain why.",
+    "Call out omitted context, outdated context, misleading framing, headline/body mismatches, and other misinformation patterns when present.",
+    "After the explanation paragraphs, on its own, add a blank line, then a line with exactly: Sources:",
+    "Then one line per cited source in order, each line exactly: [n] - https://full.url/path (for example: [1] - https://example.com/page )",
+    "After the source lines, add a blank line, then a line with exactly: Searches:",
+    "Then list every Exa search query from the Exa searches performed section, one per line in order, exactly in this format: (1) - query text, (2) - query text, and so on, with no bullets or extra text.",
+  ];
+
+  if (additionalContext) {
+    sections.push("", `Additional context from the API caller: ${additionalContext}`);
+  }
+
+  sections.push(
+    "",
+    "Article metadata:",
+    `Title: ${webpage.title ?? "Untitled"}`,
+    `URL: ${webpage.url}`,
+    `Published date: ${webpage.publishedDate ?? "Unknown"}`,
+    `Author: ${webpage.author ?? "Unknown"}`,
+    `Text truncated: ${webpage.truncated ? "yes" : "no"}`,
+    "",
+    "Article text:",
+    webpage.text,
+    "",
+    searchContext,
+  );
+
+  return sections.join("\n");
+}
+
+function normalizeAudioMimeType(value: string | null): string {
+  const mimeType = value?.split(";")[0]?.trim().toLowerCase();
+
+  if (!mimeType || mimeType === "application/octet-stream") {
+    return "audio/mpeg";
+  }
+
+  return mimeType;
+}
+
+async function runExaSearches(
+  requestId: string,
+  searches: SearchQuery[],
+  resultsPerQuery: number,
+  excludedUrls: string[] = [],
+): Promise<SearchResultContext[]> {
+  const excludedUrlKeys = new Set(
+    excludedUrls
+      .map((url) => normalizeUrlKey(url))
+      .filter((urlKey): urlKey is string => Boolean(urlKey)),
+  );
+
+  logEvent(requestId, "exa_search_started", {
+    searchType: exaSearchType,
+    queryCount: searches.length,
+    resultsPerQuery,
+    textMaxCharacters: exaTextMaxCharacters,
+    excludedUrls,
+  });
+
+  const responses = await Promise.all(searches.map((search) => runExaSearch(search.query, resultsPerQuery)));
   const seenUrls = new Set<string>();
   const results: SearchResultContext[] = [];
 
@@ -1347,12 +2468,13 @@ async function runExaSearches(requestId: string, searches: SearchQuery[]): Promi
     for (const result of responses[index].results ?? []) {
       const url = typeof result.url === "string" ? result.url.trim() : "";
       const text = typeof result.text === "string" ? result.text.trim() : "";
+      const urlKey = normalizeUrlKey(url);
 
-      if (!url || !text || seenUrls.has(url)) {
+      if (!url || !text || !urlKey || seenUrls.has(urlKey) || excludedUrlKeys.has(urlKey)) {
         continue;
       }
 
-      seenUrls.add(url);
+      seenUrls.add(urlKey);
       results.push({
         author: typeof result.author === "string" && result.author.trim() ? result.author.trim() : null,
         publishedDate: typeof result.publishedDate === "string" && result.publishedDate.trim()
@@ -1380,7 +2502,7 @@ async function runExaSearches(requestId: string, searches: SearchQuery[]): Promi
   return results;
 }
 
-async function runExaSearch(query: string): Promise<ExaSearchResponse> {
+async function runExaSearch(query: string, resultsPerQuery: number): Promise<ExaSearchResponse> {
   const response = await fetch("https://api.exa.ai/search", {
     method: "POST",
     headers: {
@@ -1390,7 +2512,7 @@ async function runExaSearch(query: string): Promise<ExaSearchResponse> {
     body: JSON.stringify({
       query,
       type: exaSearchType,
-      numResults: exaResultsPerQuery,
+      numResults: resultsPerQuery,
       contents: {
         text: {
           maxCharacters: exaTextMaxCharacters,
@@ -1508,13 +2630,44 @@ function getFilenameFromHeaders(headers: Headers): string | null {
   return plainMatch?.[1] ?? null;
 }
 
-function buildWarnings(searches: SearchQuery[], results: SearchResultContext[]): string[] {
+function normalizeUrlKey(value: string): string | null {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    url.hostname = url.hostname.toLowerCase();
+    url.pathname = url.pathname.replace(/\/+$/, "") || "/";
+    return url.toString();
+  } catch {
+    return value.trim() || null;
+  }
+}
+
+function limitText(value: string, maxCharacters: number): { text: string; truncated: boolean } {
+  if (maxCharacters > 0 && value.length > maxCharacters) {
+    return {
+      text: `${value.slice(0, maxCharacters).trimEnd()}\n\n[Text truncated at ${maxCharacters} characters.]`,
+      truncated: true,
+    };
+  }
+
+  return {
+    text: value,
+    truncated: false,
+  };
+}
+
+function buildWarnings(
+  searches: SearchQuery[],
+  results: SearchResultContext[],
+  targetQueryCount: number,
+  upperBoundOnly: boolean,
+): string[] {
   const warnings: string[] = [];
 
   if (!searches.length) {
     warnings.push("Gemini did not produce any Exa search queries for this response.");
-  } else if (searches.length < exaSearchQueryCount) {
-    warnings.push(`Gemini produced only ${searches.length} Exa search quer${searches.length === 1 ? "y" : "ies"}, below the configured target of ${exaSearchQueryCount}.`);
+  } else if (!upperBoundOnly && searches.length < targetQueryCount) {
+    warnings.push(`Gemini produced only ${searches.length} Exa search quer${searches.length === 1 ? "y" : "ies"}, below the configured target of ${targetQueryCount}.`);
   }
 
   if (!results.length) {
