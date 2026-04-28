@@ -324,7 +324,7 @@ All variables are optional unless marked required.
 | -------- | ----------- | ------- |
 | `PORT` | Port the API listens on | `7110` |
 | `RATE_LIMIT_WINDOW_MS` | `/api/check` global rate limit window in ms | `86400000` |
-| `RATE_LIMIT_MAX` | Max `/api/check` requests per main window across all callers | `10` |
+| `RATE_LIMIT_MAX` | Max `/api/check` requests per main window across all callers | `20` |
 | `HEALTH_RATE_LIMIT_WINDOW_MS` | Health endpoint rate limit window in ms | `500` |
 | `HEALTH_RATE_LIMIT_MAX` | Max requests per health window | `1` |
 | `GEMINI_API_KEY` | Gemini Developer API key | required for `/api/check` |
