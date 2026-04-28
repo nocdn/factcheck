@@ -13,7 +13,7 @@ WORKDIR /usr/src/app
 ENV NODE_ENV=production
 
 COPY --from=deps /usr/src/app/node_modules ./node_modules
-COPY package.json tsconfig.json ./
+COPY package.json tsconfig.json README.md ./
 COPY src ./src
 
 USER bun

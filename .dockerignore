@@ -8,6 +8,7 @@ Dockerfile
 compose.yaml
 docker-compose.yml
 *.md
+!README.md
 
 # agent files
 AGENTS.md

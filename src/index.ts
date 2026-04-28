@@ -1,12 +1,24 @@
 import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { mainLimiter } from "./middleware";
-import { port } from "./config";
+import { geminiApiKey, exaApiKey, port } from "./config";
 import { normalizeFactCheckError } from "./utils/errors";
 import health from "./routes/health";
 import docs from "./routes/docs";
 import jobs from "./routes/jobs";
 import check from "./routes/check";
+
+if (!geminiApiKey) {
+  console.warn(
+    "GEMINI_API_KEY (or GOOGLE_API_KEY) is not set — /api/check requests will fail.",
+  );
+}
+
+if (!exaApiKey) {
+  console.warn(
+    "EXA_API_KEY is not set — /api/check requests will fail.",
+  );
+}
 
 const app = new Hono();
 
