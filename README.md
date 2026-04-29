@@ -30,6 +30,16 @@ inline-video approach. If it fails again, a final fallback attempts
 transcription-based fact-checking (audio download + Cohere transcript, exactly
 like YouTube URLs). This requires `COHERE_API_KEY`.
 
+speed
+
+When `speed` is set to `fast`, every non-webpage URL is processed as a
+transcript instead of raw inline video, no matter which platform it points to.
+This skips the inline-video path entirely and downloads audio for transcription
+via Cohere. `regular` (the default) preserves the current behavior: social-media
+URLs are sent as inline video with retry + fallback to transcription, and
+YouTube URLs are always transcribed regardless of this setting. Articles
+(`sourceType: webpage`) are never affected by `speed`.
+
 curl -X POST http://localhost:{PORT}/api/check \
   -H 'content-type: application/json' \
   -d '{
@@ -62,18 +72,19 @@ curl http://localhost:{PORT}/api/check/12345678
 
 Request fields
 
-| Field             | Type    | Default | Description                                          |
-| ----------------- | ------- | ------- | ---------------------------------------------------- |
-| url               | string  | —       | required in JSON; optional in file mode             |
-| sourceType        | string  | auto    | auto, video, webpage                                 |
-| quality           | string  | 1080p   | best, 2160p, 1440p, 1080p, 720p, 480p, 360p          |
-| searchType        | string  | auto    | instant, deep, reasoning (or raw Exa values)         |
-| model             | string  | env     | gemini-3-flash-preview or gemini-3.1-flash-lite      |
-| effort            | string  | high    | minimal, low, medium, high (alias: reasoningEffort)  |
-| mode              | string  | direct  | direct (wait) or queue (return job id)               |
-| additionalContext | string  | —       | optional extra instructions for the prompt          |
-| iosCompatible     | boolean | true    | passed to downloader                                 |
-| proxy             | boolean | false   | passed to downloader                                 |
+| Field             | Type    | Default  | Description                                          |
+| ----------------- | ------- | -------- | ---------------------------------------------------- |
+| url               | string  | —        | required in JSON; optional in file mode             |
+| sourceType        | string  | auto     | auto, video, webpage                                 |
+| quality           | string  | 1080p    | best, 2160p, 1440p, 1080p, 720p, 480p, 360p          |
+| searchType        | string  | auto     | instant, deep, reasoning (or raw Exa values)         |
+| model             | string  | env      | gemini-3-flash-preview or gemini-3.1-flash-lite      |
+| effort            | string  | high     | minimal, low, medium, high (alias: reasoningEffort)  |
+| mode              | string  | direct   | direct (wait) or queue (return job id)               |
+| speed             | string  | regular  | fast (always transcribe) or regular (inline video)   |
+| additionalContext | string  | —        | optional extra instructions for the prompt          |
+| iosCompatible     | boolean | true     | passed to downloader                                 |
+| proxy             | boolean | false    | passed to downloader                                 |
 
 searchType values
 

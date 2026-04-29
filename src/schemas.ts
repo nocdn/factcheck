@@ -74,6 +74,7 @@ export const factCheckJsonBodySchema = z
     reasoningEffort: z.string().optional(),
     effort: z.string().optional(),
     mode: z.enum(["direct", "queue"]).default("direct"),
+    speed: z.enum(["fast", "regular"]).default("regular"),
     additionalContext: z.string().optional(),
     iosCompatible: z.boolean().default(true),
     proxy: z.boolean().default(false),

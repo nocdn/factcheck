@@ -27,6 +27,7 @@ export type GeminiRequestSettings = {
 };
 
 export type RequestMode = "direct" | "queue";
+export type Speed = "fast" | "regular";
 
 export type ExaSearchType =
   | "auto"
@@ -104,6 +105,7 @@ export type InlineVideoInput = {
 export type ParsedFactCheckRequest =
   | {
       additionalContext: string | null;
+      speed: Speed | null;
       inputMode: "url";
       iosCompatible: boolean;
       mode: RequestMode;

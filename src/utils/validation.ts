@@ -50,9 +50,14 @@ export function isKnownVideoPageUrl(url: URL | string): boolean {
 export function resolveUrlProcessingMode(
   url: URL,
   sourceType: UrlSourceType,
+  speed?: "fast" | "regular",
 ): "video" | "transcript" | "webpage" {
   if (sourceType === "webpage") {
     return "webpage";
+  }
+
+  if (speed === "fast") {
+    return "transcript";
   }
 
   if (sourceType === "video") {

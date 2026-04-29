@@ -79,7 +79,7 @@ check.post("/", async (c) => {
     return c.json(
       {
         error:
-          "Cohere is not configured. Set COHERE_API_KEY to enable YouTube transcript fact-checking.",
+          "Cohere is not configured. Set COHERE_API_KEY to enable transcript fact-checking.",
       },
       500,
     );
@@ -99,6 +99,7 @@ check.post("/", async (c) => {
       parsedBody.inputMode === "url" ? parsedBody.iosCompatible : null,
     proxy: parsedBody.inputMode === "url" ? parsedBody.proxy : null,
     urlMode: parsedBody.inputMode === "url" ? parsedBody.urlMode : null,
+    speed: parsedBody.inputMode === "url" ? parsedBody.speed : null,
     additionalContextLength: parsedBody.additionalContext?.length ?? 0,
     inlineVideoMaxBytes,
     geminiModels: parsedBody.models,
@@ -767,11 +768,17 @@ async function parseFactCheckRequest(
       data.reasoningEffort,
     );
 
-    const urlMode = resolveUrlProcessingMode(data.parsedUrl, data.sourceType);
+    const urlMode = resolveUrlProcessingMode(
+      data.parsedUrl,
+      data.sourceType,
+      data.speed,
+    );
+    const speed = data.speed ?? null;
 
     return {
       additionalContext:
         data.additionalContext?.trim() ? data.additionalContext.trim() : null,
+      speed,
       inputMode: "url",
       iosCompatible: data.iosCompatible,
       mode: data.mode as "direct" | "queue",
