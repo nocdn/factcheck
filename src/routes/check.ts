@@ -39,6 +39,7 @@ import type {
 import { HttpError, normalizeFactCheckError } from "../utils/errors";
 import { combineAbortSignals, delay, normalizeMimeType } from "../utils/helpers";
 import { logEvent, truncate } from "../utils/logging";
+import { logger } from "../utils/logger";
 import { createJobId, createRequestId } from "../utils/ids";
 import { resolveUrlProcessingMode } from "../utils/validation";
 import { factCheckJsonBodySchema, formatZodErrors } from "../schemas";
@@ -246,7 +247,10 @@ async function runQueuedFactCheck(
       status: "completed",
     });
   } catch (error) {
-    console.error(`[fact-check:${requestId}]`, error);
+    logger.error(
+      { requestId, error: error instanceof Error ? error.message : String(error) },
+      "Queued fact-check failed",
+    );
     const normalized = normalizeFactCheckError(error);
     factCheckJobs.set(requestId, {
       completedAt: Date.now(),
@@ -271,6 +275,47 @@ async function runFactCheck(
     return runWebpageFactCheck(requestId, parsedBody, abortSignal);
   }
 
+  if (parsedBody.inputMode === "url" && parsedBody.urlMode === "video") {
+    return runSocialMediaFactCheckWithFallback(requestId, parsedBody, abortSignal);
+  }
+
+  return runInlineVideoFactCheck(requestId, parsedBody, abortSignal);
+}
+
+async function runSocialMediaFactCheckWithFallback(
+  requestId: string,
+  parsedBody: Extract<ParsedFactCheckRequest, { inputMode: "url" }>,
+  abortSignal?: AbortSignal,
+): Promise<import("../types").FactCheckResponse> {
+  try {
+    return await runInlineVideoFactCheck(requestId, parsedBody, abortSignal);
+  } catch (firstError) {
+    logEvent(requestId, "video_fact_check_retry_started", {
+      error: firstError instanceof Error ? firstError.message : String(firstError),
+    });
+
+    try {
+      await delay(2000);
+      return await runInlineVideoFactCheck(requestId, parsedBody, abortSignal);
+    } catch (secondError) {
+      logEvent(requestId, "video_fact_check_fallback_to_transcript", {
+        error: secondError instanceof Error ? secondError.message : String(secondError),
+      });
+
+      if (!cohereApiKey) {
+        throw secondError;
+      }
+
+      return runTranscriptFactCheck(requestId, parsedBody, abortSignal);
+    }
+  }
+}
+
+async function runInlineVideoFactCheck(
+  requestId: string,
+  parsedBody: ParsedFactCheckRequest,
+  abortSignal?: AbortSignal,
+): Promise<import("../types").FactCheckResponse> {
   const videoInput =
     parsedBody.inputMode === "url"
       ? await downloadVideoForInlineUse(requestId, {

@@ -17,7 +17,7 @@ health.get("/", (c) => {
     geminiConfigured: Boolean(geminiApiKey),
     exaConfigured: Boolean(exaApiKey),
     cohereConfigured: Boolean(cohereApiKey),
-    model: defaultGeminiSettings.model,
+    model: defaultGeminiSettings.models.searchPlan,
     models: defaultGeminiSettings.models,
     reasoningEffort: defaultGeminiSettings.reasoningEffort,
   });

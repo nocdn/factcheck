@@ -1,4 +1,5 @@
 import { HttpError } from "./errors";
+import { logEvent } from "./logging";
 
 export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -132,9 +133,11 @@ export async function fetchWithRetry(
 
     if (attempt < maxRetries) {
       if (requestId) {
-        console.log(
-          `[fact-check:${requestId}] ${serviceName}_retry_scheduled ${JSON.stringify({ attempt: attempt + 1, delayMs: retryDelayMs, maxRetries })}`,
-        );
+        logEvent(requestId, `${serviceName}_retry_scheduled`, {
+          attempt: attempt + 1,
+          delayMs: retryDelayMs,
+          maxRetries,
+        });
       }
       await delay(retryDelayMs);
     }

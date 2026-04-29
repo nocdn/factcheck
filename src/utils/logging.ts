@@ -1,10 +1,12 @@
+import { logger } from "./logger";
+
 export function logEvent(
   requestId: string | null,
   event: string,
   payload: Record<string, unknown>,
 ): void {
-  const prefix = requestId ? `[fact-check:${requestId}]` : "[fact-check]";
-  console.log(`${prefix} ${event} ${JSON.stringify(payload)}`);
+  const child = requestId ? logger.child({ requestId }) : logger;
+  child.info({ ...payload, event }, event);
 }
 
 export function truncate(value: string, maxLength: number): string {

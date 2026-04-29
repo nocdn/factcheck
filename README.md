@@ -24,6 +24,12 @@ curl -X POST http://localhost:{PORT}/api/check \
     "mode": "direct"
   }'
 
+Social-media videos (TikTok, Instagram, X, etc.) are sent to Gemini as inline
+video data. If that fails, the request is retried once more with the same
+inline-video approach. If it fails again, a final fallback attempts
+transcription-based fact-checking (audio download + Cohere transcript, exactly
+like YouTube URLs). This requires `COHERE_API_KEY`.
+
 curl -X POST http://localhost:{PORT}/api/check \
   -H 'content-type: application/json' \
   -d '{
@@ -93,7 +99,7 @@ Response fields
 | reasoning         | Gemini thinking text when available                   |
 | download          | downloader metadata (URL mode only)                   |
 | uploadedFile      | file metadata (upload mode only)                      |
-| transcription     | Cohere transcript + audio metadata (YouTube only)     |
+| transcription     | Cohere transcript + audio metadata (YouTube and social-media fallback) |
 | webpage           | Exa article metadata (article mode only)              |
 | research          | Exa queries, searchType used, and full-text results   |
 | usage             | prompt, candidate, thought, and total tokens          |
@@ -105,7 +111,7 @@ Environment
 | ---------------------------------------- | -------- | ---------------------------------------------------- | ------------------------------------------ |
 | GEMINI_API_KEY                           | yes      | Gemini Developer API key                             | —                                          |
 | EXA_API_KEY                              | yes      | Exa API key                                          | —                                          |
-| COHERE_API_KEY                           | yes*     | Cohere API key for YouTube transcription             | —                                          |
+| COHERE_API_KEY                           | yes*     | Cohere API key for transcription (YouTube and social-media fallback) | —                                          |
 | GEMINI_MODEL                             | no       | default model                                        | gemini-3-flash-preview                     |
 | REASONING_EFFORT                         | no       | default reasoning effort                             | high                                       |
 | EXA_SEARCH_TYPE                          | no       | default searchType                                   | auto                                       |
@@ -140,8 +146,17 @@ Environment
 | COHERE_RETRY_COUNT                       | no       | Cohere retry count                                   | 2                                          |
 | COHERE_RETRY_DELAY_MS                    | no       | Cohere retry delay (ms)                              | 5000                                       |
 | DIRECT_MODE_TIMEOUT_MS                   | no       | timeout for direct-mode requests (ms)                | 600000                                     |
+| LOG_LEVEL                                | no       | pino log level (trace, debug, info, warn, error)     | info (production), debug (development)     |
+| NODE_ENV                                 | no       | set to `production` for JSON logs; dev gets color    | —                                          |
+| PRETTY_LOGS                              | no       | `true` forces colorized pretty logs, `false` forces JSON | auto (JSON in production, pretty in dev) |
 
-* COHERE_API_KEY required only for YouTube URLs.
+* COHERE_API_KEY required for YouTube URLs and for the social-media transcript fallback.
+
+Logging
+
+The app uses [Pino](https://github.com/pinojs/pino). In development (when `NODE_ENV` is not `production`) logs are colorized, timestamped, and indented by pino-pretty. In production they are emitted as compact newline-delimited JSON for easy piping to log aggregators. Every request-scoped log line carries a `requestId` so you can trace a single fact-check from start to finish.
+
+You can override the default format with `PRETTY_LOGS=true` (force pretty) or `PRETTY_LOGS=false` (force JSON) regardless of `NODE_ENV`.
 
 Rate limiting
 
