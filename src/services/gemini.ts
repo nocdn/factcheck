@@ -3,8 +3,8 @@ import {
   geminiApiKey,
   geminiHighDemandRetryCount,
   geminiHighDemandRetryDelayMs,
-  geminiStepDelayMs,
   geminiTimeoutMs,
+  providerStepDelayMs,
   searchPlanMaxOutputTokens,
 } from "../config";
 import {
@@ -35,15 +35,15 @@ export async function delayBeforeGeminiStep(
   requestId: string,
   step: string,
 ): Promise<void> {
-  if (geminiStepDelayMs <= 0) {
+  if (providerStepDelayMs <= 0) {
     return;
   }
 
-  logEvent(requestId, "gemini_step_delay_started", {
-    delayMs: geminiStepDelayMs,
+  logEvent(requestId, "provider_step_delay_started", {
+    delayMs: providerStepDelayMs,
     step,
   });
-  await delay(geminiStepDelayMs);
+  await delay(providerStepDelayMs);
 }
 
 export async function generateGeminiContentWithRetry(
@@ -127,7 +127,7 @@ export async function createSearchPlan(
     mimeType: videoInput.mimeType,
     sizeBytes: videoInput.sizeBytes,
     model: geminiSettings.models.searchPlan,
-    reasoningEffort: geminiSettings.reasoningEffort,
+    effort: geminiSettings.effort,
     thinkingLevel: geminiSettings.thinkingLevel,
   });
 
@@ -187,7 +187,7 @@ export async function createTranscriptSearchPlan(
     transcriptCharacters: transcript.length,
     maxQueries,
     model: geminiSettings.models.searchPlan,
-    reasoningEffort: geminiSettings.reasoningEffort,
+    effort: geminiSettings.effort,
     thinkingLevel: geminiSettings.thinkingLevel,
     transcriptMode: true,
   });
@@ -253,7 +253,7 @@ export async function createWebpageSearchPlan(
     webpageTitle: webpage.title,
     webpageCharacters: webpage.text.length,
     model: geminiSettings.models.searchPlan,
-    reasoningEffort: geminiSettings.reasoningEffort,
+    effort: geminiSettings.effort,
     thinkingLevel: geminiSettings.thinkingLevel,
     webpageMode: true,
   });

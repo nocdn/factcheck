@@ -10,7 +10,7 @@ import check from "./routes/check";
 
 if (!geminiApiKey) {
   logger.warn(
-    "GEMINI_API_KEY (or GOOGLE_API_KEY) is not set — /api/check requests will fail.",
+    "GEMINI_API_KEY is not set — Gemini /api/check requests will fail.",
   );
 }
 

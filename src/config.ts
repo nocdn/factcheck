@@ -1,11 +1,18 @@
 import { ThinkingLevel } from "@google/genai";
 import {
+  supportedEfforts,
+  supportedGeminiEfforts,
   supportedGeminiModels,
-  supportedReasoningEfforts,
+  supportedOpenAiEfforts,
+  supportedOpenAiModels,
+  type Effort,
   type ExaSearchType,
+  type FactCheckRequestSettings,
   type GeminiRequestSettings,
-  type ReasoningEffort,
+  type ModelProvider,
+  type OpenAiRequestSettings,
   type SupportedGeminiModel,
+  type SupportedOpenAiModel,
 } from "./types";
 
 export const defaultPort = 7110;
@@ -25,11 +32,9 @@ export const healthLimit = parseIntegerEnv("HEALTH_RATE_LIMIT_MAX", 1);
 export const videoDownloadApiUrl =
   process.env.VIDEO_DOWNLOAD_API_URL?.trim() ||
   "https://videos.bartoszbak.org/api/download";
-export const geminiApiKey =
-  process.env.GEMINI_API_KEY?.trim() ||
-  process.env.GOOGLE_API_KEY?.trim() ||
-  "";
+export const geminiApiKey = process.env.GEMINI_API_KEY?.trim() || "";
 export const exaApiKey = process.env.EXA_API_KEY?.trim() || "";
+export const openAiApiKey = process.env.OPENAI_API_KEY?.trim() || "";
 
 export const supportedExaSearchTypes: readonly ExaSearchType[] = [
   "auto",
@@ -118,7 +123,8 @@ export const cohereTranscribeTimeoutMs = parseIntegerEnv(
   300_000,
 );
 export const geminiTimeoutMs = parseIntegerEnv("GEMINI_TIMEOUT_MS", 300_000);
-export const geminiStepDelayMs = parseNonNegativeIntegerEnv(
+export const openAiTimeoutMs = parseIntegerEnv("OPENAI_TIMEOUT_MS", 300_000);
+export const providerStepDelayMs = parseNonNegativeIntegerEnv(
   "GEMINI_STEP_DELAY_MS",
   10_000,
 );
@@ -159,17 +165,20 @@ export const cohereRetryDelayMs = parseNonNegativeIntegerEnv(
   5_000,
 );
 export const factCheckMaxOutputTokens = parseIntegerEnv(
-  "FACT_CHECK_MAX_OUTPUT_TOKENS",
+  "MAX_OUTPUT_TOKENS",
   32_768,
 );
 export const searchPlanMaxOutputTokens = parseIntegerEnv(
-  "FACT_CHECK_SEARCH_PLAN_MAX_OUTPUT_TOKENS",
+  "SEARCH_PLAN_MAX_OUTPUT_TOKENS",
   2_048,
 );
 export const defaultGeminiModel =
   process.env.GEMINI_MODEL?.trim() || "gemini-3-flash-preview";
-export const defaultReasoningEffort =
-  process.env.REASONING_EFFORT?.trim().toLowerCase() || "high";
+export const defaultOpenAiModel = process.env.OPENAI_MODEL?.trim() || "gpt-5.5";
+export const defaultEffort =
+  process.env.EFFORT?.trim().toLowerCase() || "high";
+export const defaultOpenAiEffort =
+  process.env.OPENAI_EFFORT?.trim().toLowerCase() || "medium";
 
 export const supportedQualities = new Set([
   "best",
@@ -181,16 +190,16 @@ export const supportedQualities = new Set([
   "360p",
 ]);
 
-export const supportedReasoningEffortsByModel: Record<
+export const supportedEffortsByModel: Record<
   SupportedGeminiModel,
-  readonly ReasoningEffort[]
+  readonly (typeof supportedGeminiEfforts)[number][]
 > = {
-  "gemini-3-flash-preview": supportedReasoningEfforts,
-  "gemini-3.1-flash-lite-preview": supportedReasoningEfforts,
+  "gemini-3-flash-preview": supportedGeminiEfforts,
+  "gemini-3.1-flash-lite-preview": supportedGeminiEfforts,
 };
 
-export const thinkingLevelByReasoningEffort: Record<
-  ReasoningEffort,
+export const thinkingLevelByEffort: Record<
+  (typeof supportedGeminiEfforts)[number],
   ThinkingLevel
 > = {
   minimal: ThinkingLevel.MINIMAL,
@@ -201,7 +210,12 @@ export const thinkingLevelByReasoningEffort: Record<
 
 export const defaultGeminiSettings = resolveGeminiSettings(
   defaultGeminiModel,
-  defaultReasoningEffort,
+  defaultEffort,
+);
+
+export const defaultOpenAiSettings = resolveOpenAiSettings(
+  defaultOpenAiModel,
+  defaultOpenAiEffort,
 );
 
 export function parseIntegerEnv(name: string, fallback: number): number {
@@ -249,12 +263,15 @@ export function resolveGeminiSettings(
     | SupportedGeminiModel
     | [SupportedGeminiModel, SupportedGeminiModel]
     | string
-    | string[],
-  rawReasoningEffort: string,
+    | string[]
+    | undefined,
+  rawEffort: string | undefined,
 ): GeminiRequestSettings {
-  if (!isReasoningEffort(rawReasoningEffort)) {
+  const effort = rawEffort || defaultEffort;
+
+  if (!isGeminiEffort(effort)) {
     throw new Error(
-      `The reasoningEffort field must be one of: ${supportedReasoningEfforts.join(", ")}.`,
+      `The effort field must be one of: ${supportedGeminiEfforts.join(", ")} for Gemini.`,
     );
   }
 
@@ -262,19 +279,20 @@ export function resolveGeminiSettings(
   const requestedModels = [models.searchPlan, models.finalAnswer];
 
   for (const model of requestedModels) {
-    const supportedEfforts = supportedReasoningEffortsByModel[model];
+    const supportedModelEfforts = supportedEffortsByModel[model];
 
-    if (!supportedEfforts.includes(rawReasoningEffort)) {
+    if (!supportedModelEfforts.includes(effort)) {
       throw new Error(
-        `The reasoningEffort field must be one of: ${supportedEfforts.join(", ")} for model ${model}.`,
+        `The effort field must be one of: ${supportedModelEfforts.join(", ")} for model ${model}.`,
       );
     }
   }
 
   return {
+    provider: "google",
     models,
-    reasoningEffort: rawReasoningEffort,
-    thinkingLevel: thinkingLevelByReasoningEffort[rawReasoningEffort],
+    effort,
+    thinkingLevel: thinkingLevelByEffort[effort],
   };
 }
 
@@ -325,7 +343,8 @@ export function resolveGeminiStepModels(
     | SupportedGeminiModel
     | [SupportedGeminiModel, SupportedGeminiModel]
     | string
-    | string[],
+    | string[]
+    | undefined,
 ): GeminiRequestSettings["models"] {
   const normalized = normalizeRequestedModel(
     Array.isArray(rawModel) ? rawModel : String(rawModel),
@@ -344,12 +363,164 @@ export function resolveGeminiStepModels(
   };
 }
 
+export function resolveFactCheckSettings(
+  provider: ModelProvider,
+  rawModel: string | string[] | undefined,
+  rawEffort: string | undefined,
+): FactCheckRequestSettings {
+  if (provider === "openai") {
+    return resolveOpenAiSettings(rawModel, rawEffort);
+  }
+
+  return resolveGeminiSettings(rawModel, rawEffort);
+}
+
+export function resolveOpenAiSettings(
+  rawModel:
+    | SupportedOpenAiModel
+    | [SupportedOpenAiModel, SupportedOpenAiModel]
+    | string
+    | string[]
+    | undefined,
+  rawEffort: string | undefined,
+): OpenAiRequestSettings {
+  const effort = rawEffort || defaultOpenAiEffort;
+
+  if (!isOpenAiEffort(effort)) {
+    throw new Error(
+      `The effort field must be one of: ${supportedOpenAiEfforts.join(", ")} for OpenAI.`,
+    );
+  }
+
+  const models = resolveOpenAiStepModels(rawModel);
+
+  for (const model of [models.searchPlan, models.finalAnswer]) {
+    const supportedModelEfforts = getSupportedOpenAiEfforts(model);
+
+    if (!supportedModelEfforts.includes(effort)) {
+      throw new Error(
+        `The effort field must be one of: ${supportedModelEfforts.join(", ")} for model ${model}.`,
+      );
+    }
+  }
+
+  return {
+    provider: "openai",
+    models,
+    effort,
+    thinkingLevel: null,
+  };
+}
+
+function getSupportedOpenAiEfforts(
+  model: SupportedOpenAiModel,
+): readonly Effort[] {
+  if (model === "gpt-5" || model === "gpt-5-mini" || model === "gpt-5-nano") {
+    return ["minimal", "low", "medium", "high"];
+  }
+
+  return ["none", "low", "medium", "high", "xhigh"];
+}
+
+export function resolveOpenAiStepModels(
+  rawModel:
+    | SupportedOpenAiModel
+    | [SupportedOpenAiModel, SupportedOpenAiModel]
+    | string
+    | string[]
+    | undefined,
+): OpenAiRequestSettings["models"] {
+  const normalized = normalizeRequestedOpenAiModel(rawModel);
+
+  if (Array.isArray(normalized)) {
+    return {
+      searchPlan: normalized[0],
+      finalAnswer: normalized[1],
+    };
+  }
+
+  return {
+    searchPlan: normalized,
+    finalAnswer: normalized,
+  };
+}
+
+export function normalizeRequestedOpenAiModel(
+  rawModel: string | string[] | undefined,
+): SupportedOpenAiModel | [SupportedOpenAiModel, SupportedOpenAiModel] {
+  if (typeof rawModel === "undefined") {
+    return resolveDefaultOpenAiModel();
+  }
+
+  if (typeof rawModel === "string") {
+    const model = rawModel.trim();
+
+    if (!model) {
+      return resolveDefaultOpenAiModel();
+    }
+
+    if (!isSupportedOpenAiModel(model)) {
+      throw new Error(
+        `The model field must be one of these OpenAI models: ${supportedOpenAiModels.join(", ")}.`,
+      );
+    }
+
+    return model;
+  }
+
+  if (rawModel.length !== 2) {
+    throw new Error(
+      "The model array must contain exactly two model IDs: search planning, then final answer.",
+    );
+  }
+
+  const models = rawModel.map((model) => model.trim());
+
+  for (const model of models) {
+    if (!isSupportedOpenAiModel(model)) {
+      throw new Error(
+        `Each model array item must be one of these OpenAI models: ${supportedOpenAiModels.join(", ")}.`,
+      );
+    }
+  }
+
+  return [models[0] as SupportedOpenAiModel, models[1] as SupportedOpenAiModel];
+}
+
+function resolveDefaultOpenAiModel(): SupportedOpenAiModel {
+  if (!isSupportedOpenAiModel(defaultOpenAiModel)) {
+    throw new Error(
+      `OPENAI_MODEL must be one of: ${supportedOpenAiModels.join(", ")}.`,
+    );
+  }
+
+  return defaultOpenAiModel;
+}
+
 export function isSupportedGeminiModel(
   value: string,
 ): value is SupportedGeminiModel {
   return supportedGeminiModels.includes(value as SupportedGeminiModel);
 }
 
-export function isReasoningEffort(value: string): value is ReasoningEffort {
-  return supportedReasoningEfforts.includes(value as ReasoningEffort);
+export function isSupportedOpenAiModel(
+  value: string,
+): value is SupportedOpenAiModel {
+  return supportedOpenAiModels.includes(value as SupportedOpenAiModel);
+}
+
+export function isEffort(value: string): value is Effort {
+  return supportedEfforts.includes(value as Effort);
+}
+
+export function isGeminiEffort(
+  value: string,
+): value is (typeof supportedGeminiEfforts)[number] {
+  return supportedGeminiEfforts.includes(
+    value as (typeof supportedGeminiEfforts)[number],
+  );
+}
+
+export function isOpenAiEffort(value: string): value is Effort {
+  return supportedOpenAiEfforts.includes(value as Effort);
 }

@@ -1,27 +1,40 @@
 import { z } from "zod";
 import {
   defaultGeminiSettings,
+  defaultOpenAiSettings,
   exaSearchTypeAliases,
   supportedExaSearchTypes,
 } from "./config";
-import { supportedGeminiModels, supportedReasoningEfforts } from "./types";
+import {
+  supportedGeminiModels,
+  supportedModelProviders,
+  supportedOpenAiModels,
+  supportedEfforts,
+  type ModelProvider,
+} from "./types";
 
-const supportedGeminiModelSchema = z.enum(supportedGeminiModels);
-
-export const reasoningEffortSchema = z.enum(supportedReasoningEfforts);
+export const effortSchema = z.enum(supportedEfforts);
 
 function resolveModel(
   raw: string | string[] | undefined,
+  provider: ModelProvider,
 ): string | [string, string] {
+  const supportedModels =
+    provider === "openai" ? supportedOpenAiModels : supportedGeminiModels;
+  const defaultModel =
+    provider === "openai"
+      ? defaultOpenAiSettings.models.searchPlan
+      : defaultGeminiSettings.models.searchPlan;
+
   if (raw === undefined) {
-    return defaultGeminiSettings.models.searchPlan;
+    return defaultModel;
   }
   if (typeof raw === "string") {
     const trimmed = raw.trim();
-    if (!trimmed) return defaultGeminiSettings.models.searchPlan;
-    if (!supportedGeminiModels.includes(trimmed as any)) {
+    if (!trimmed) return defaultModel;
+    if (!supportedModels.includes(trimmed as any)) {
       throw new Error(
-        `The model field must be one of: ${supportedGeminiModels.join(", ")}.`,
+        `The model field must be one of these ${provider === "openai" ? "OpenAI" : "Gemini"} models: ${supportedModels.join(", ")}.`,
       );
     }
     return trimmed;
@@ -33,13 +46,31 @@ function resolveModel(
   }
   const models = raw.map((m) => m.trim());
   for (const m of models) {
-    if (!supportedGeminiModels.includes(m as any)) {
+    if (!supportedModels.includes(m as any)) {
       throw new Error(
-        `Each model array item must be one of: ${supportedGeminiModels.join(", ")}.`,
+        `Each model array item must be one of these ${provider === "openai" ? "OpenAI" : "Gemini"} models: ${supportedModels.join(", ")}.`,
       );
     }
   }
   return [models[0], models[1]] as [string, string];
+}
+
+function resolveProvider(raw: string | undefined): ModelProvider {
+  const normalized = raw?.trim().toLowerCase();
+
+  if (!normalized) {
+    return "openai";
+  }
+
+  if (normalized === "gemini") {
+    return "google";
+  }
+
+  if ((supportedModelProviders as readonly string[]).includes(normalized)) {
+    return normalized as ModelProvider;
+  }
+
+  throw new Error("The provider field must be one of: google, gemini, openai.");
 }
 
 function resolveExaSearchType(raw: string | undefined): string {
@@ -70,11 +101,14 @@ export const factCheckJsonBodySchema = z
       ])
       .default("1080p"),
     searchType: z.string().optional(),
+    provider: z.string().optional(),
     model: z.union([z.string(), z.array(z.string())]).optional(),
-    reasoningEffort: z.string().optional(),
     effort: z.string().optional(),
+    reasoningEffort: z
+      .never({ error: "The reasoningEffort field is not supported. Use effort." })
+      .optional(),
     mode: z.enum(["direct", "queue"]).default("direct"),
-    speed: z.enum(["fast", "regular"]).default("regular"),
+    speed: z.enum(["fast", "regular"]).default("fast"),
     additionalContext: z.string().optional(),
     iosCompatible: z.boolean().default(true),
     proxy: z.boolean().default(false),
@@ -91,30 +125,22 @@ export const factCheckJsonBodySchema = z
       throw new Error("Only http and https URLs are supported.");
     }
 
-    // Validate model
-    const resolvedModel = resolveModel(data.model);
+    const provider = resolveProvider(data.provider);
 
-    // Validate reasoning effort / effort consistency
-    const rawReasoningEffort = data.reasoningEffort?.trim();
+    // Validate model against the selected provider.
+    const resolvedModel = resolveModel(data.model, provider);
+
+    // Validate effort.
     const rawEffort = data.effort?.trim();
-    if (
-      rawReasoningEffort &&
-      rawEffort &&
-      rawReasoningEffort.toLowerCase() !== rawEffort.toLowerCase()
-    ) {
-      throw new Error(
-        "The reasoningEffort and effort fields must match when both are provided.",
-      );
-    }
+    const effort = rawEffort
+      ? rawEffort.toLowerCase()
+      : provider === "openai"
+        ? defaultOpenAiSettings.effort
+        : defaultGeminiSettings.effort;
 
-    const reasoningEffortInput = rawReasoningEffort || rawEffort;
-    const reasoningEffort = reasoningEffortInput
-      ? reasoningEffortInput.toLowerCase()
-      : defaultGeminiSettings.reasoningEffort;
-
-    if (!supportedReasoningEfforts.includes(reasoningEffort as any)) {
+    if (!supportedEfforts.includes(effort as any)) {
       throw new Error(
-        `The reasoningEffort field must be one of: ${supportedReasoningEfforts.join(", ")}.`,
+        `The effort field must be one of: ${supportedEfforts.join(", ")}.`,
       );
     }
 
@@ -123,8 +149,9 @@ export const factCheckJsonBodySchema = z
     return {
       ...data,
       parsedUrl,
+      provider,
       resolvedModel,
-      reasoningEffort: reasoningEffort as z.infer<typeof reasoningEffortSchema>,
+      effort: effort as z.infer<typeof effortSchema>,
       searchType,
     };
   });

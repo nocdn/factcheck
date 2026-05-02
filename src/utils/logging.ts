@@ -1,5 +1,12 @@
 import { logger } from "./logger";
 
+export const logPreviewLimits = {
+  modelResponse: 1_000,
+  prompt: 400,
+  reasoning: 500,
+  transcript: 300,
+} as const;
+
 export function logEvent(
   requestId: string | null,
   event: string,

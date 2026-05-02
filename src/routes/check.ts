@@ -6,9 +6,10 @@ import {
   factCheckDownloadQuality,
   factCheckMaxOutputTokens,
   geminiApiKey,
-  geminiTimeoutMs,
   inlineVideoMaxBytes,
+  openAiApiKey,
   resolveExaSearchType,
+  resolveFactCheckSettings,
   resolveGeminiSettings,
   socialsMaxSearches,
   socialsResultsPerSearch,
@@ -29,16 +30,25 @@ import {
   generateGeminiContentWithRetry,
 } from "../services/gemini";
 import {
+  createOpenAiTranscriptSearchPlan,
+  createOpenAiWebpageSearchPlan,
+  extractOpenAiText,
+  generateOpenAiAnalysis,
+} from "../services/openai";
+import {
   downloadAudioForTranscription,
   downloadVideoForInlineUse,
 } from "../services/downloader";
 import { factCheckJobs } from "../store";
 import type {
+  FactCheckResponse,
+  GeminiRequestSettings,
+  OpenAiRequestSettings,
   ParsedFactCheckRequest,
 } from "../types";
 import { HttpError, normalizeFactCheckError } from "../utils/errors";
 import { combineAbortSignals, delay, normalizeMimeType } from "../utils/helpers";
-import { logEvent, truncate } from "../utils/logging";
+import { logEvent, logPreviewLimits, truncate } from "../utils/logging";
 import { logger } from "../utils/logger";
 import { createJobId, createRequestId } from "../utils/ids";
 import { resolveUrlProcessingMode } from "../utils/validation";
@@ -47,10 +57,25 @@ import { factCheckJsonBodySchema, formatZodErrors } from "../schemas";
 const check = new Hono();
 
 check.post("/", async (c) => {
-  if (!geminiApiKey) {
+  const parsedBody = await parseFactCheckRequest(c.req.raw);
+
+  if ("error" in parsedBody) {
+    return c.json({ error: parsedBody.error }, parsedBody.status);
+  }
+
+  if (parsedBody.provider === "google" && !geminiApiKey) {
     return c.json(
       {
         error: "Gemini is not configured. Set GEMINI_API_KEY.",
+      },
+      500,
+    );
+  }
+
+  if (parsedBody.provider === "openai" && !openAiApiKey) {
+    return c.json(
+      {
+        error: "OpenAI is not configured. Set OPENAI_API_KEY.",
       },
       500,
     );
@@ -63,12 +88,6 @@ check.post("/", async (c) => {
       },
       500,
     );
-  }
-
-  const parsedBody = await parseFactCheckRequest(c.req.raw);
-
-  if ("error" in parsedBody) {
-    return c.json({ error: parsedBody.error }, parsedBody.status);
   }
 
   if (
@@ -102,8 +121,9 @@ check.post("/", async (c) => {
     speed: parsedBody.inputMode === "url" ? parsedBody.speed : null,
     additionalContextLength: parsedBody.additionalContext?.length ?? 0,
     inlineVideoMaxBytes,
-    geminiModels: parsedBody.models,
-    reasoningEffort: parsedBody.reasoningEffort,
+    models: parsedBody.models,
+    provider: parsedBody.provider,
+    effort: parsedBody.effort,
   });
 
   if (parsedBody.mode === "queue") {
@@ -169,11 +189,47 @@ function logGeminiResponse(
       uri: result.url,
       publishedDate: result.publishedDate,
     })),
-    reasoningPreview: reasoning ? truncate(reasoning, 3000) : null,
-    analysisPreview: truncate(analysis, 5000),
+    reasoningPreview: reasoning
+      ? truncate(reasoning, logPreviewLimits.reasoning)
+      : null,
+    analysisPreview: truncate(analysis, logPreviewLimits.modelResponse),
     warnings,
     ...extra,
   });
+}
+
+function buildGeminiUsage(
+  response: import("../services/gemini").GeminiGenerateContentResponse,
+): FactCheckResponse["usage"] {
+  if (!response.usageMetadata) {
+    return null;
+  }
+
+  return {
+    promptTokenCount: response.usageMetadata.promptTokenCount ?? null,
+    candidatesTokenCount: response.usageMetadata.candidatesTokenCount ?? null,
+    thoughtsTokenCount: response.usageMetadata.thoughtsTokenCount ?? null,
+    toolUsePromptTokenCount:
+      response.usageMetadata.toolUsePromptTokenCount ?? null,
+    totalTokenCount: response.usageMetadata.totalTokenCount ?? null,
+  };
+}
+
+function buildOpenAiUsage(
+  response: import("../services/openai").OpenAiResponsesResponse,
+): FactCheckResponse["usage"] {
+  if (!response.usage) {
+    return null;
+  }
+
+  return {
+    promptTokenCount: response.usage.input_tokens ?? null,
+    candidatesTokenCount: response.usage.output_tokens ?? null,
+    thoughtsTokenCount:
+      response.usage.output_tokens_details?.reasoning_tokens ?? null,
+    toolUsePromptTokenCount: null,
+    totalTokenCount: response.usage.total_tokens ?? null,
+  };
 }
 
 function buildResponse(
@@ -183,7 +239,7 @@ function buildResponse(
   reasoning: string | null,
   searchPlan: { searches: import("../types").SearchQuery[] },
   searchResults: import("../types").SearchResultContext[],
-  response: import("../services/gemini").GeminiGenerateContentResponse,
+  usage: FactCheckResponse["usage"],
   warnings: string[],
   extras: {
     download?: import("../types").FactCheckResponse["download"];
@@ -196,12 +252,13 @@ function buildResponse(
     id: requestId,
     inputMode: parsedBody.inputMode,
     url: parsedBody.url,
+    provider: parsedBody.provider,
     model:
       parsedBody.models.searchPlan === parsedBody.models.finalAnswer
         ? parsedBody.models.searchPlan
         : [parsedBody.models.searchPlan, parsedBody.models.finalAnswer],
     models: parsedBody.models,
-    reasoningEffort: parsedBody.reasoningEffort,
+    effort: parsedBody.effort,
     analysis,
     reasoning,
     download: extras.download ?? null,
@@ -220,17 +277,7 @@ function buildResponse(
         author: result.author,
       })),
     },
-    usage: response.usageMetadata
-      ? {
-          promptTokenCount: response.usageMetadata.promptTokenCount ?? null,
-          candidatesTokenCount:
-            response.usageMetadata.candidatesTokenCount ?? null,
-          thoughtsTokenCount: response.usageMetadata.thoughtsTokenCount ?? null,
-          toolUsePromptTokenCount:
-            response.usageMetadata.toolUsePromptTokenCount ?? null,
-          totalTokenCount: response.usageMetadata.totalTokenCount ?? null,
-        }
-      : null,
+    usage,
     warnings,
   };
 }
@@ -268,6 +315,28 @@ async function runFactCheck(
   parsedBody: ParsedFactCheckRequest,
   abortSignal?: AbortSignal,
 ): Promise<import("../types").FactCheckResponse> {
+  if (parsedBody.provider === "openai") {
+    if (parsedBody.inputMode !== "url") {
+      throw new HttpError(
+        400,
+        "OpenAI fact-checking only supports URL requests processed through text. Use provider google for direct video uploads.",
+      );
+    }
+
+    if (parsedBody.urlMode === "transcript") {
+      return runOpenAiTranscriptFactCheck(requestId, parsedBody, abortSignal);
+    }
+
+    if (parsedBody.urlMode === "webpage") {
+      return runOpenAiWebpageFactCheck(requestId, parsedBody, abortSignal);
+    }
+
+    throw new HttpError(
+      400,
+      "OpenAI fact-checking only supports speed: fast for video URLs because OpenAI models cannot ingest video directly.",
+    );
+  }
+
   if (parsedBody.inputMode === "url" && parsedBody.urlMode === "transcript") {
     return runTranscriptFactCheck(requestId, parsedBody, abortSignal);
   }
@@ -317,6 +386,7 @@ async function runInlineVideoFactCheck(
   parsedBody: ParsedFactCheckRequest,
   abortSignal?: AbortSignal,
 ): Promise<import("../types").FactCheckResponse> {
+  const geminiSettings = getGeminiSettings(parsedBody);
   const videoInput =
     parsedBody.inputMode === "url"
       ? await downloadVideoForInlineUse(requestId, {
@@ -347,7 +417,7 @@ async function runInlineVideoFactCheck(
     requestId,
     videoInput,
     prompt,
-    parsedBody,
+    geminiSettings,
     socialsMaxSearches,
     abortSignal,
   );
@@ -375,10 +445,10 @@ async function runInlineVideoFactCheck(
     sizeBytes: videoInput.sizeBytes,
     filename: videoInput.filename,
     systemInstructionPreview: truncate(buildSystemInstruction("video"), 300),
-    promptPreview: truncate(finalPrompt, 500),
+    promptPreview: truncate(finalPrompt, logPreviewLimits.prompt),
     responseMimeType: "text/plain",
-    thinkingLevel: parsedBody.thinkingLevel,
-    geminiModel: parsedBody.models.finalAnswer,
+    thinkingLevel: geminiSettings.thinkingLevel,
+    geminiModel: geminiSettings.models.finalAnswer,
     exaSearchEnabled: true,
     exaSearchType: parsedBody.searchType,
     exaSearchQueryActualCount: searchPlan.searches.length,
@@ -390,7 +460,7 @@ async function runInlineVideoFactCheck(
     requestId,
     "final_answer",
     {
-      model: parsedBody.models.finalAnswer,
+      model: geminiSettings.models.finalAnswer,
       contents: [
         {
           inlineData: {
@@ -410,7 +480,7 @@ async function runInlineVideoFactCheck(
         temperature: 0.2,
         thinkingConfig: {
           includeThoughts: true,
-          thinkingLevel: parsedBody.thinkingLevel,
+          thinkingLevel: geminiSettings.thinkingLevel,
         },
       },
     },
@@ -442,7 +512,7 @@ async function runInlineVideoFactCheck(
     warnings,
   );
 
-  return buildResponse(requestId, parsedBody, analysis, reasoning, searchPlan, searchResults, response, warnings, {
+  return buildResponse(requestId, parsedBody, analysis, reasoning, searchPlan, searchResults, buildGeminiUsage(response), warnings, {
     download:
       parsedBody.inputMode === "url"
         ? {
@@ -473,6 +543,7 @@ async function runTranscriptFactCheck(
   parsedBody: Extract<ParsedFactCheckRequest, { inputMode: "url" }>,
   abortSignal?: AbortSignal,
 ): Promise<import("../types").FactCheckResponse> {
+  const geminiSettings = getGeminiSettings(parsedBody);
   const audioInput = await downloadAudioForTranscription(requestId, {
     downloadMode: "audio",
     iosCompatible: parsedBody.iosCompatible,
@@ -488,7 +559,7 @@ async function runTranscriptFactCheck(
     transcript,
     parsedBody.url,
     parsedBody.additionalContext,
-    parsedBody,
+    geminiSettings,
     youtubeMaxSearches,
     abortSignal,
   );
@@ -522,10 +593,10 @@ async function runTranscriptFactCheck(
       buildSystemInstruction("transcript"),
       300,
     ),
-    promptPreview: truncate(finalPrompt, 500),
+    promptPreview: truncate(finalPrompt, logPreviewLimits.prompt),
     responseMimeType: "text/plain",
-    thinkingLevel: parsedBody.thinkingLevel,
-    geminiModel: parsedBody.models.finalAnswer,
+    thinkingLevel: geminiSettings.thinkingLevel,
+    geminiModel: geminiSettings.models.finalAnswer,
     exaSearchEnabled: true,
     exaSearchType: parsedBody.searchType,
     exaSearchQueryActualCount: searchPlan.searches.length,
@@ -538,7 +609,7 @@ async function runTranscriptFactCheck(
     requestId,
     "final_answer",
     {
-      model: parsedBody.models.finalAnswer,
+      model: geminiSettings.models.finalAnswer,
       contents: [
         {
           text: finalPrompt,
@@ -552,7 +623,7 @@ async function runTranscriptFactCheck(
         temperature: 0.2,
         thinkingConfig: {
           includeThoughts: true,
-          thinkingLevel: parsedBody.thinkingLevel,
+          thinkingLevel: geminiSettings.thinkingLevel,
         },
       },
     },
@@ -585,7 +656,113 @@ async function runTranscriptFactCheck(
     { transcriptMode: true },
   );
 
-  return buildResponse(requestId, parsedBody, analysis, reasoning, searchPlan, searchResults, response, warnings, {
+  return buildResponse(requestId, parsedBody, analysis, reasoning, searchPlan, searchResults, buildGeminiUsage(response), warnings, {
+    transcription: {
+      provider: "cohere",
+      model: "cohere-transcribe-03-2026",
+      language: "en",
+      characterCount: transcript.length,
+      audio: {
+        apiUrl: videoDownloadApiUrl,
+        filename: audioInput.filename,
+        mimeType: audioInput.mimeType,
+        sizeBytes: audioInput.sizeBytes,
+        iosCompatible: parsedBody.iosCompatible,
+        proxy: parsedBody.proxy,
+      },
+    },
+  });
+}
+
+async function runOpenAiTranscriptFactCheck(
+  requestId: string,
+  parsedBody: Extract<ParsedFactCheckRequest, { inputMode: "url" }>,
+  abortSignal?: AbortSignal,
+): Promise<import("../types").FactCheckResponse> {
+  const settings = getOpenAiSettings(parsedBody);
+  const audioInput = await downloadAudioForTranscription(requestId, {
+    downloadMode: "audio",
+    iosCompatible: parsedBody.iosCompatible,
+    proxy: parsedBody.proxy,
+    quality: parsedBody.quality,
+    url: parsedBody.url,
+  }, abortSignal);
+
+  const transcript = await transcribeAudioWithCohere(requestId, audioInput, abortSignal);
+
+  const searchPlan = await createOpenAiTranscriptSearchPlan(
+    requestId,
+    transcript,
+    parsedBody.url,
+    parsedBody.additionalContext,
+    settings,
+    youtubeMaxSearches,
+    abortSignal,
+  );
+
+  const searchResults = await runExaSearches(
+    requestId,
+    searchPlan.searches,
+    youtubeResultsPerSearch,
+    parsedBody.searchType,
+    [],
+    abortSignal,
+  );
+  const searchContext = buildSearchContext(searchResults, searchPlan.searches);
+  const finalPrompt = buildFactCheckPrompt("transcript", {
+    url: parsedBody.url,
+    additionalContext: parsedBody.additionalContext,
+    transcript,
+    searchContext,
+  });
+
+  await delayBeforeGeminiStep(requestId, "final_answer");
+
+  logEvent(requestId, "openai_request_prepared", {
+    inputMode: "url",
+    sourceUrl: parsedBody.url,
+    transcriptCharacters: transcript.length,
+    audioMimeType: audioInput.mimeType,
+    audioSizeBytes: audioInput.sizeBytes,
+    audioFilename: audioInput.filename,
+    systemInstructionPreview: truncate(
+      buildSystemInstruction("transcript"),
+      300,
+    ),
+    promptPreview: truncate(finalPrompt, logPreviewLimits.prompt),
+    responseMimeType: "text/plain",
+    openAiModel: settings.models.finalAnswer,
+    provider: "openai",
+    exaSearchEnabled: true,
+    exaSearchType: parsedBody.searchType,
+    exaSearchQueryActualCount: searchPlan.searches.length,
+    exaSearchResultCount: searchResults.length,
+    transcriptMode: true,
+  });
+
+  const response = await generateOpenAiAnalysis(
+    requestId,
+    "final_answer",
+    settings,
+    finalPrompt,
+    buildSystemInstruction("transcript"),
+    abortSignal,
+  );
+
+  const analysis = extractOpenAiText(response);
+
+  if (!analysis) {
+    throw new HttpError(502, "OpenAI returned an empty response.");
+  }
+
+  const warnings = buildWarnings(
+    searchPlan.searches,
+    searchResults,
+    youtubeMaxSearches,
+    true,
+  );
+
+  return buildResponse(requestId, parsedBody, analysis, null, searchPlan, searchResults, buildOpenAiUsage(response), warnings, {
     transcription: {
       provider: "cohere",
       model: "cohere-transcribe-03-2026",
@@ -615,12 +792,13 @@ async function runWebpageFactCheck(
   parsedBody: Extract<ParsedFactCheckRequest, { inputMode: "url" }>,
   abortSignal?: AbortSignal,
 ): Promise<import("../types").FactCheckResponse> {
+  const geminiSettings = getGeminiSettings(parsedBody);
   const webpage = await getExaWebpageContent(requestId, parsedBody.url, abortSignal);
   const searchPlan = await createWebpageSearchPlan(
     requestId,
     webpage,
     parsedBody.additionalContext,
-    parsedBody,
+    geminiSettings,
     articleMaxSearches,
     abortSignal,
   );
@@ -650,10 +828,10 @@ async function runWebpageFactCheck(
     webpageCharacters: webpage.text.length,
     webpageTruncated: webpage.truncated,
     systemInstructionPreview: truncate(buildSystemInstruction("webpage"), 300),
-    promptPreview: truncate(finalPrompt, 500),
+    promptPreview: truncate(finalPrompt, logPreviewLimits.prompt),
     responseMimeType: "text/plain",
-    thinkingLevel: parsedBody.thinkingLevel,
-    geminiModel: parsedBody.models.finalAnswer,
+    thinkingLevel: geminiSettings.thinkingLevel,
+    geminiModel: geminiSettings.models.finalAnswer,
     exaSearchEnabled: true,
     exaSearchType: parsedBody.searchType,
     exaSearchQueryActualCount: searchPlan.searches.length,
@@ -665,7 +843,7 @@ async function runWebpageFactCheck(
     requestId,
     "final_answer",
     {
-      model: parsedBody.models.finalAnswer,
+      model: geminiSettings.models.finalAnswer,
       contents: [
         {
           text: finalPrompt,
@@ -679,7 +857,7 @@ async function runWebpageFactCheck(
         temperature: 0.2,
         thinkingConfig: {
           includeThoughts: true,
-          thinkingLevel: parsedBody.thinkingLevel,
+          thinkingLevel: geminiSettings.thinkingLevel,
         },
       },
     },
@@ -718,7 +896,7 @@ async function runWebpageFactCheck(
     { webpageMode: true },
   );
 
-  return buildResponse(requestId, parsedBody, analysis, reasoning, searchPlan, searchResults, response, warnings, {
+  return buildResponse(requestId, parsedBody, analysis, reasoning, searchPlan, searchResults, buildGeminiUsage(response), warnings, {
     webpage: {
       provider: "exa",
       title: webpage.title,
@@ -729,6 +907,132 @@ async function runWebpageFactCheck(
       truncated: webpage.truncated,
     },
   });
+}
+
+async function runOpenAiWebpageFactCheck(
+  requestId: string,
+  parsedBody: Extract<ParsedFactCheckRequest, { inputMode: "url" }>,
+  abortSignal?: AbortSignal,
+): Promise<import("../types").FactCheckResponse> {
+  const settings = getOpenAiSettings(parsedBody);
+  const webpage = await getExaWebpageContent(requestId, parsedBody.url, abortSignal);
+  const searchPlan = await createOpenAiWebpageSearchPlan(
+    requestId,
+    webpage,
+    parsedBody.additionalContext,
+    settings,
+    articleMaxSearches,
+    abortSignal,
+  );
+  const searchResults = await runExaSearches(
+    requestId,
+    searchPlan.searches,
+    articleResultsPerSearch,
+    parsedBody.searchType,
+    [parsedBody.url, webpage.url],
+    abortSignal,
+  );
+  const searchContext = buildSearchContext(searchResults, searchPlan.searches);
+  const finalPrompt = buildFactCheckPrompt("webpage", {
+    additionalContext: parsedBody.additionalContext,
+    webpage,
+    searchContext,
+  });
+
+  await delayBeforeGeminiStep(requestId, "final_answer");
+
+  logEvent(requestId, "openai_request_prepared", {
+    inputMode: "url",
+    urlMode: "webpage",
+    sourceUrl: parsedBody.url,
+    webpageUrl: webpage.url,
+    webpageTitle: webpage.title,
+    webpageCharacters: webpage.text.length,
+    webpageTruncated: webpage.truncated,
+    systemInstructionPreview: truncate(buildSystemInstruction("webpage"), 300),
+    promptPreview: truncate(finalPrompt, logPreviewLimits.prompt),
+    responseMimeType: "text/plain",
+    openAiModel: settings.models.finalAnswer,
+    provider: "openai",
+    exaSearchEnabled: true,
+    exaSearchType: parsedBody.searchType,
+    exaSearchQueryActualCount: searchPlan.searches.length,
+    exaSearchResultCount: searchResults.length,
+  });
+
+  const response = await generateOpenAiAnalysis(
+    requestId,
+    "final_answer",
+    settings,
+    finalPrompt,
+    buildSystemInstruction("webpage"),
+    abortSignal,
+  );
+
+  const analysis = extractOpenAiText(response);
+
+  if (!analysis) {
+    throw new HttpError(502, "OpenAI returned an empty response.");
+  }
+
+  const warnings = buildWarnings(
+    searchPlan.searches,
+    searchResults,
+    articleMaxSearches,
+    true,
+  );
+
+  if (webpage.truncated) {
+    warnings.push(
+      `Exa returned more article text than EXA_SEARCH_TEXT_MAX_CHARACTERS (${exaTextMaxCharacters}); the article was truncated before OpenAI analysis.`,
+    );
+  }
+
+  return buildResponse(requestId, parsedBody, analysis, null, searchPlan, searchResults, buildOpenAiUsage(response), warnings, {
+    webpage: {
+      provider: "exa",
+      title: webpage.title,
+      url: webpage.url,
+      publishedDate: webpage.publishedDate,
+      author: webpage.author,
+      characterCount: webpage.text.length,
+      truncated: webpage.truncated,
+    },
+  });
+}
+
+function getOpenAiSettings(
+  parsedBody: Extract<ParsedFactCheckRequest, { inputMode: "url" }>,
+): OpenAiRequestSettings {
+  if (parsedBody.provider !== "openai") {
+    throw new HttpError(500, "Expected an OpenAI fact-check request.");
+  }
+
+  return {
+    provider: "openai",
+    models: {
+      searchPlan: parsedBody.models.searchPlan as OpenAiRequestSettings["models"]["searchPlan"],
+      finalAnswer: parsedBody.models.finalAnswer as OpenAiRequestSettings["models"]["finalAnswer"],
+    },
+    effort: parsedBody.effort,
+    thinkingLevel: null,
+  };
+}
+
+function getGeminiSettings(parsedBody: ParsedFactCheckRequest): GeminiRequestSettings {
+  if (parsedBody.provider !== "google" || parsedBody.thinkingLevel === null) {
+    throw new HttpError(500, "Expected a Gemini fact-check request.");
+  }
+
+  return {
+    provider: "google",
+    models: {
+      searchPlan: parsedBody.models.searchPlan as GeminiRequestSettings["models"]["searchPlan"],
+      finalAnswer: parsedBody.models.finalAnswer as GeminiRequestSettings["models"]["finalAnswer"],
+    },
+    effort: parsedBody.effort,
+    thinkingLevel: parsedBody.thinkingLevel,
+  };
 }
 
 async function parseFactCheckRequest(
@@ -763,9 +1067,10 @@ async function parseFactCheckRequest(
   const data = parsed.data;
 
   try {
-    const geminiSettings = resolveGeminiSettings(
+    const settings = resolveFactCheckSettings(
+      data.provider,
       data.resolvedModel,
-      data.reasoningEffort,
+      data.effort,
     );
 
     const urlMode = resolveUrlProcessingMode(
@@ -775,6 +1080,16 @@ async function parseFactCheckRequest(
     );
     const speed = data.speed ?? null;
 
+    if (
+      settings.provider === "openai" &&
+      urlMode !== "webpage" &&
+      data.speed !== "fast"
+    ) {
+      throw new Error(
+        "OpenAI provider only supports speed: fast for video URLs because OpenAI models cannot ingest videos directly.",
+      );
+    }
+
     return {
       additionalContext:
         data.additionalContext?.trim() ? data.additionalContext.trim() : null,
@@ -782,12 +1097,13 @@ async function parseFactCheckRequest(
       inputMode: "url",
       iosCompatible: data.iosCompatible,
       mode: data.mode as "direct" | "queue",
-      models: geminiSettings.models,
+      models: settings.models,
+      provider: settings.provider,
       proxy: data.proxy,
       quality: data.quality,
-      reasoningEffort: geminiSettings.reasoningEffort,
+      effort: settings.effort,
       searchType: data.searchType as import("../types").ExaSearchType,
-      thinkingLevel: geminiSettings.thinkingLevel,
+      thinkingLevel: settings.thinkingLevel,
       url: data.parsedUrl.toString(),
       urlMode,
       useTranscript: urlMode === "transcript",
@@ -865,7 +1181,8 @@ async function parseMultipartFactCheckRequest(
 
   const additionalContextEntry = formData.get("additionalContext");
   const modelEntry = formData.get("model");
-  const reasoningEffortEntry = formData.get("reasoningEffort");
+  const providerEntry = formData.get("provider");
+  const legacyReasoningEffortEntry = formData.get("reasoningEffort");
   const effortEntry = formData.get("effort");
   const modeEntry = formData.get("mode");
   const searchTypeEntry = formData.get("searchType");
@@ -878,13 +1195,35 @@ async function parseMultipartFactCheckRequest(
     return { error: "The mode field must be either direct or queue.", status: 400 };
   }
 
-  const reasoningEffortStr =
-    (typeof reasoningEffortEntry === "string" && reasoningEffortEntry.trim()
-      ? reasoningEffortEntry.trim()
-      : undefined) ??
-    (typeof effortEntry === "string" && effortEntry.trim()
+  if (legacyReasoningEffortEntry !== null) {
+    return {
+      error: "The reasoningEffort field is not supported. Use effort.",
+      status: 400,
+    };
+  }
+
+  const provider =
+    typeof providerEntry === "string" && providerEntry.trim()
+      ? providerEntry.trim().toLowerCase()
+      : "openai";
+  if (provider === "openai") {
+    return {
+      error:
+        "OpenAI provider cannot fact-check uploaded video files because OpenAI models cannot ingest videos directly. Set provider to google or gemini for file uploads.",
+      status: 400,
+    };
+  }
+  if (provider !== "google" && provider !== "gemini") {
+    return {
+      error: "The provider field must be one of: google, gemini, openai.",
+      status: 400,
+    };
+  }
+
+  const effort =
+    typeof effortEntry === "string" && effortEntry.trim()
       ? effortEntry.trim()
-      : undefined);
+      : undefined;
 
   let resolvedSearchType: string;
   try {
@@ -906,7 +1245,7 @@ async function parseMultipartFactCheckRequest(
       rawModel = trimmed.startsWith("[") ? JSON.parse(trimmed) : trimmed;
     }
 
-    geminiSettings = resolveGeminiSettings(rawModel, reasoningEffortStr);
+    geminiSettings = resolveGeminiSettings(rawModel, effort);
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Invalid Gemini settings.";
@@ -935,7 +1274,8 @@ async function parseMultipartFactCheckRequest(
     mimeType,
     mode: mode as "direct" | "queue",
     models: geminiSettings.models,
-    reasoningEffort: geminiSettings.reasoningEffort,
+    provider: "google",
+    effort: geminiSettings.effort,
     searchType: resolvedSearchType as import("../types").ExaSearchType,
     sizeBytes: bytes.byteLength,
     thinkingLevel: geminiSettings.thinkingLevel,

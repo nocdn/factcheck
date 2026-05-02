@@ -1,30 +1,81 @@
 import { ThinkingLevel } from "@google/genai";
 
 export type SupportedGeminiModel = (typeof supportedGeminiModels)[number];
-export type ReasoningEffort = (typeof supportedReasoningEfforts)[number];
+export type SupportedOpenAiModel = (typeof supportedOpenAiModels)[number];
+export type SupportedFactCheckModel =
+  | SupportedGeminiModel
+  | SupportedOpenAiModel;
+export type ModelProvider = (typeof supportedModelProviders)[number];
+export type Effort = (typeof supportedEfforts)[number];
+
+export const supportedModelProviders = ["google", "openai"] as const;
 
 export const supportedGeminiModels = [
   "gemini-3-flash-preview",
   "gemini-3.1-flash-lite-preview",
 ] as const;
 
-export const supportedReasoningEfforts = [
+export const supportedOpenAiModels = [
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-5.4-nano",
+  "gpt-5.2",
+  "gpt-5",
+  "gpt-5-mini",
+  "gpt-5-nano",
+] as const;
+
+export const supportedEfforts = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const;
+
+export const supportedGeminiEfforts = [
   "minimal",
   "low",
   "medium",
   "high",
 ] as const;
 
+export const supportedOpenAiEfforts = supportedEfforts;
+
 export type GeminiModels = {
   finalAnswer: SupportedGeminiModel;
   searchPlan: SupportedGeminiModel;
 };
 
+export type OpenAiModels = {
+  finalAnswer: SupportedOpenAiModel;
+  searchPlan: SupportedOpenAiModel;
+};
+
+export type FactCheckModels = {
+  finalAnswer: SupportedFactCheckModel;
+  searchPlan: SupportedFactCheckModel;
+};
+
 export type GeminiRequestSettings = {
+  provider: "google";
   models: GeminiModels;
-  reasoningEffort: ReasoningEffort;
+  effort: Effort;
   thinkingLevel: ThinkingLevel;
 };
+
+export type OpenAiRequestSettings = {
+  provider: "openai";
+  models: OpenAiModels;
+  effort: Effort;
+  thinkingLevel: null;
+};
+
+export type FactCheckRequestSettings =
+  | GeminiRequestSettings
+  | OpenAiRequestSettings;
 
 export type RequestMode = "direct" | "queue";
 export type Speed = "fast" | "regular";
@@ -109,12 +160,13 @@ export type ParsedFactCheckRequest =
       inputMode: "url";
       iosCompatible: boolean;
       mode: RequestMode;
-      models: GeminiModels;
+      models: FactCheckModels;
+      provider: ModelProvider;
       proxy: boolean;
       quality: string;
-      reasoningEffort: ReasoningEffort;
+      effort: Effort;
       searchType: ExaSearchType;
-      thinkingLevel: ThinkingLevel;
+      thinkingLevel: ThinkingLevel | null;
       url: string;
       urlMode: UrlProcessingMode;
       useTranscript: boolean;
@@ -126,9 +178,9 @@ export type ParsedFactCheckRequest =
       inputMode: "file";
       mimeType: string;
       mode: RequestMode;
-  model: SupportedGeminiModel | [SupportedGeminiModel, SupportedGeminiModel];
-  models: GeminiModels;
-  reasoningEffort: ReasoningEffort;
+      models: GeminiModels;
+      provider: "google";
+      effort: Effort;
       searchType: ExaSearchType;
       sizeBytes: number;
       thinkingLevel: ThinkingLevel;
@@ -139,8 +191,10 @@ export type FactCheckResponse = {
   id: string;
   inputMode: "url" | "file";
   url: string | null;
-  models: GeminiModels;
-  reasoningEffort: ReasoningEffort;
+  provider: ModelProvider;
+  model: SupportedFactCheckModel | [SupportedFactCheckModel, SupportedFactCheckModel];
+  models: FactCheckModels;
+  effort: Effort;
   analysis: string;
   reasoning: string | null;
   download: {

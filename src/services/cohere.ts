@@ -8,7 +8,7 @@ import {
 } from "../config";
 import { throwIfNotOk } from "../utils/errors";
 import { combineAbortSignals, fetchWithRetry } from "../utils/helpers";
-import { truncate } from "../utils/logging";
+import { logPreviewLimits, truncate } from "../utils/logging";
 import { isRecord } from "../utils/validation";
 import { logEvent } from "../utils/logging";
 
@@ -84,7 +84,7 @@ export async function transcribeAudioWithCohere(
     model: cohereTranscribeModel,
     language: cohereTranscribeLanguage,
     transcriptCharacters: transcript.length,
-    transcriptPreview: truncate(transcript, 500),
+    transcriptPreview: truncate(transcript, logPreviewLimits.transcript),
   });
 
   return transcript;

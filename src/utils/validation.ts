@@ -151,21 +151,21 @@ export function parseMultipartModelEntry(
 
 export function parseGeminiOverrides(
   rawModel: string | string[] | undefined,
-  rawReasoningEffort: string | undefined,
+  rawEffort: string | undefined,
 ): GeminiRequestSettings | { error: string } {
   try {
     const model = normalizeRequestedModel(rawModel);
-    const reasoningEffort = rawReasoningEffort?.trim().toLowerCase()
-      ? rawReasoningEffort.trim().toLowerCase()
-      : defaultGeminiSettings.reasoningEffort;
+    const effort = rawEffort?.trim().toLowerCase()
+      ? rawEffort.trim().toLowerCase()
+      : defaultGeminiSettings.effort;
 
-    return resolveGeminiSettings(model, reasoningEffort);
+    return resolveGeminiSettings(model, effort);
   } catch (error) {
     return {
       error:
         error instanceof Error
           ? error.message
-          : "Invalid Gemini model or reasoningEffort.",
+          : "Invalid Gemini model or effort.",
     };
   }
 }
